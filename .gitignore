@@ -1,0 +1,11 @@
+.claude/
+PLAN.md
+DESIGN_DECISIONS.md
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
