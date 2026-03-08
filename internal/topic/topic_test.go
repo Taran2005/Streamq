@@ -4,11 +4,43 @@ import (
 	"testing"
 )
 
-func TestNewTopicValid(t *testing.T) {
-	tp, err := NewTopic("orders", 3)
-	if err != nil {
+func makePartitions(n int) []*Partition {
+	parts := make([]*Partition, n)
+	for i := 0; i < n; i++ {
+		parts[i] = NewPartition(i, &testStore{messages: make([]Message, 0)})
+	}
+	return parts
+}
+
+func TestValidateTopicParams(t *testing.T) {
+	if err := ValidateTopicParams("orders", 3); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestValidateTopicInvalidNames(t *testing.T) {
+	bad := []string{"", "has spaces", "special!", "a/b", ".hidden"}
+	for _, name := range bad {
+		if err := ValidateTopicParams(name, 1); err == nil {
+			t.Errorf("expected error for topic name %q, got nil", name)
+		}
+	}
+}
+
+func TestValidateTopicInvalidPartitions(t *testing.T) {
+	if err := ValidateTopicParams("test", 0); err == nil {
+		t.Error("expected error for 0 partitions")
+	}
+	if err := ValidateTopicParams("test", -1); err == nil {
+		t.Error("expected error for -1 partitions")
+	}
+	if err := ValidateTopicParams("test", 1025); err == nil {
+		t.Error("expected error for 1025 partitions")
+	}
+}
+
+func TestNewTopic(t *testing.T) {
+	tp := NewTopic("orders", makePartitions(3))
 	if tp.Name != "orders" {
 		t.Errorf("expected name 'orders', got %q", tp.Name)
 	}
@@ -17,33 +49,8 @@ func TestNewTopicValid(t *testing.T) {
 	}
 }
 
-func TestNewTopicInvalidNames(t *testing.T) {
-	bad := []string{"", "has spaces", "special!", "a/b", ".hidden"}
-	for _, name := range bad {
-		_, err := NewTopic(name, 1)
-		if err == nil {
-			t.Errorf("expected error for topic name %q, got nil", name)
-		}
-	}
-}
-
-func TestNewTopicInvalidPartitions(t *testing.T) {
-	_, err := NewTopic("test", 0)
-	if err == nil {
-		t.Error("expected error for 0 partitions")
-	}
-	_, err = NewTopic("test", -1)
-	if err == nil {
-		t.Error("expected error for -1 partitions")
-	}
-	_, err = NewTopic("test", 1025)
-	if err == nil {
-		t.Error("expected error for 1025 partitions")
-	}
-}
-
 func TestGetPartition(t *testing.T) {
-	tp, _ := NewTopic("test", 3)
+	tp := NewTopic("test", makePartitions(3))
 
 	p, err := tp.GetPartition(0)
 	if err != nil || p.ID != 0 {
@@ -62,9 +69,8 @@ func TestGetPartition(t *testing.T) {
 }
 
 func TestRoundRobin(t *testing.T) {
-	tp, _ := NewTopic("test", 3)
+	tp := NewTopic("test", makePartitions(3))
 
-	// Round-robin should cycle through partitions 0, 1, 2, 0, 1, 2...
 	ids := make([]int, 6)
 	for i := 0; i < 6; i++ {
 		ids[i] = tp.NextPartition().ID
@@ -79,7 +85,7 @@ func TestRoundRobin(t *testing.T) {
 }
 
 func TestTopicInfo(t *testing.T) {
-	tp, _ := NewTopic("events", 5)
+	tp := NewTopic("events", makePartitions(5))
 	info := tp.Info()
 	if info.Name != "events" || info.PartitionCount != 5 {
 		t.Errorf("unexpected info: %+v", info)
