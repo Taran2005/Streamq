@@ -14,7 +14,10 @@ import (
 func setupTestServer(t *testing.T) (*httptest.Server, *Broker) {
 	t.Helper()
 	cfg := DefaultConfig()
-	b := New(cfg)
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := NewServer(b)
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	t.Cleanup(ts.Close)

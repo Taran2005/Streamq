@@ -5,92 +5,77 @@ import (
 	"time"
 )
 
-// Partition is an ordered, append-only list of messages.
-// In Kafka terms: one partition = one ordered log.
-//
-// Why sync.RWMutex?
-//   - Multiple consumers can READ at the same time (RLock)
-//   - Only one producer can WRITE at a time (Lock)
-//   - This is way faster than a regular Mutex when reads >> writes
-type Partition struct {
-	ID       int
-	messages []Message
-	mu       sync.RWMutex
+// Store is the interface partition uses for message storage.
+// Defined here to avoid circular imports (storage imports topic for Message).
+type Store interface {
+	Append(msg Message) (uint64, error)
+	Read(offset uint64, maxMessages int) ([]Message, error)
+	LatestOffset() uint64
+	Close() error
+}
 
-	// notifyCh is used for long-polling.
-	// When a new message arrives, we close this channel to wake up all waiting consumers.
-	// Then we create a fresh channel for the next wait cycle.
+// Partition is an ordered, append-only log backed by a Store.
+// The Store handles actual data (memory or disk).
+// Partition handles the notify channel for long-polling.
+type Partition struct {
+	ID    int
+	store Store
+	mu    sync.RWMutex
+
 	notifyCh chan struct{}
 }
 
-// NewPartition creates an empty partition with the given ID.
-func NewPartition(id int) *Partition {
+// NewPartition creates a partition backed by the given store.
+func NewPartition(id int, store Store) *Partition {
 	return &Partition{
 		ID:       id,
-		messages: make([]Message, 0),
+		store:    store,
 		notifyCh: make(chan struct{}),
 	}
 }
 
-// Append adds a message to the end of the partition.
-// It assigns the next sequential offset and the current timestamp.
-// Returns the assigned offset.
-func (p *Partition) Append(key, value string) uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	offset := uint64(len(p.messages))
+// Append adds a message to the partition via the store.
+func (p *Partition) Append(key, value string) (uint64, error) {
 	msg := Message{
-		Offset:    offset,
 		Key:       key,
 		Value:     value,
 		Timestamp: time.Now().UnixNano(),
 		Partition: p.ID,
 	}
-	p.messages = append(p.messages, msg)
 
-	// Wake up any consumers that are long-polling (waiting for new data).
-	// Closing a channel wakes ALL goroutines blocked on it — like a broadcast signal.
+	offset, err := p.store.Append(msg)
+	if err != nil {
+		return 0, err
+	}
+
+	// Wake up long-polling consumers
+	p.mu.Lock()
 	oldCh := p.notifyCh
 	p.notifyCh = make(chan struct{})
 	close(oldCh)
+	p.mu.Unlock()
 
-	return offset
+	return offset, nil
 }
 
 // Read returns messages starting from the given offset.
-// If offset is beyond the end, returns an empty slice (not an error).
-// maxMessages limits how many messages to return (0 = no limit).
-func (p *Partition) Read(offset uint64, maxMessages int) []Message {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if offset >= uint64(len(p.messages)) {
-		return []Message{}
-	}
-
-	end := uint64(len(p.messages))
-	if maxMessages > 0 && offset+uint64(maxMessages) < end {
-		end = offset + uint64(maxMessages)
-	}
-
-	// Return a COPY so the caller can't mess with our internal slice.
-	result := make([]Message, end-offset)
-	copy(result, p.messages[offset:end])
-	return result
+func (p *Partition) Read(offset uint64, maxMessages int) ([]Message, error) {
+	return p.store.Read(offset, maxMessages)
 }
 
-// LatestOffset returns the offset that the NEXT message would get.
+// LatestOffset returns the next offset that would be assigned.
 func (p *Partition) LatestOffset() uint64 {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return uint64(len(p.messages))
+	return p.store.LatestOffset()
 }
 
 // WaitForData returns a channel that gets closed when new data arrives.
-// Used for long-polling: consumer blocks on this channel until a producer writes something.
 func (p *Partition) WaitForData() <-chan struct{} {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.notifyCh
+}
+
+// Close closes the underlying store.
+func (p *Partition) Close() error {
+	return p.store.Close()
 }

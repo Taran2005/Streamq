@@ -6,20 +6,60 @@ import (
 	"time"
 )
 
-func TestPartitionAppendAndRead(t *testing.T) {
-	p := NewPartition(0)
+// testStore is a minimal in-memory Store for tests.
+// Avoids importing storage package (which imports topic → cycle).
+type testStore struct {
+	messages []Message
+	mu       sync.RWMutex
+}
 
-	// Append 3 messages
-	off0 := p.Append("k1", "hello")
-	off1 := p.Append("k2", "world")
-	off2 := p.Append("", "no key")
+func (s *testStore) Append(msg Message) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msg.Offset = uint64(len(s.messages))
+	s.messages = append(s.messages, msg)
+	return msg.Offset, nil
+}
+
+func (s *testStore) Read(offset uint64, max int) ([]Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if offset >= uint64(len(s.messages)) {
+		return []Message{}, nil
+	}
+	end := uint64(len(s.messages))
+	if max > 0 && offset+uint64(max) < end {
+		end = offset + uint64(max)
+	}
+	result := make([]Message, end-offset)
+	copy(result, s.messages[offset:end])
+	return result, nil
+}
+
+func (s *testStore) LatestOffset() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return uint64(len(s.messages))
+}
+
+func (s *testStore) Close() error { return nil }
+
+func newTestPartition(id int) *Partition {
+	return NewPartition(id, &testStore{messages: make([]Message, 0)})
+}
+
+func TestPartitionAppendAndRead(t *testing.T) {
+	p := newTestPartition(0)
+
+	off0, _ := p.Append("k1", "hello")
+	off1, _ := p.Append("k2", "world")
+	off2, _ := p.Append("", "no key")
 
 	if off0 != 0 || off1 != 1 || off2 != 2 {
 		t.Fatalf("expected offsets 0,1,2 got %d,%d,%d", off0, off1, off2)
 	}
 
-	// Read all from offset 0
-	msgs := p.Read(0, 0)
+	msgs, _ := p.Read(0, 0)
 	if len(msgs) != 3 {
 		t.Fatalf("expected 3 messages, got %d", len(msgs))
 	}
@@ -30,27 +70,24 @@ func TestPartitionAppendAndRead(t *testing.T) {
 		t.Errorf("message 2 mismatch: %+v", msgs[2])
 	}
 
-	// Read from offset 1
-	msgs = p.Read(1, 0)
+	msgs, _ = p.Read(1, 0)
 	if len(msgs) != 2 {
 		t.Fatalf("expected 2 messages from offset 1, got %d", len(msgs))
 	}
 
-	// Read with limit
-	msgs = p.Read(0, 1)
+	msgs, _ = p.Read(0, 1)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message with limit, got %d", len(msgs))
 	}
 
-	// Read past end returns empty slice
-	msgs = p.Read(100, 0)
+	msgs, _ = p.Read(100, 0)
 	if len(msgs) != 0 {
 		t.Fatalf("expected empty slice for read past end, got %v", msgs)
 	}
 }
 
 func TestPartitionLatestOffset(t *testing.T) {
-	p := NewPartition(0)
+	p := newTestPartition(0)
 
 	if p.LatestOffset() != 0 {
 		t.Fatalf("expected 0 for empty partition, got %d", p.LatestOffset())
@@ -63,10 +100,9 @@ func TestPartitionLatestOffset(t *testing.T) {
 }
 
 func TestPartitionConcurrentAppends(t *testing.T) {
-	p := NewPartition(0)
+	p := newTestPartition(0)
 	var wg sync.WaitGroup
 
-	// 100 goroutines each appending 100 messages = 10,000 total
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
@@ -82,8 +118,7 @@ func TestPartitionConcurrentAppends(t *testing.T) {
 		t.Fatalf("expected 10000 messages after concurrent appends, got %d", p.LatestOffset())
 	}
 
-	// Verify all offsets are unique and sequential
-	msgs := p.Read(0, 0)
+	msgs, _ := p.Read(0, 0)
 	seen := make(map[uint64]bool)
 	for _, m := range msgs {
 		if seen[m.Offset] {
@@ -94,25 +129,20 @@ func TestPartitionConcurrentAppends(t *testing.T) {
 }
 
 func TestPartitionLongPolling(t *testing.T) {
-	p := NewPartition(0)
+	p := newTestPartition(0)
 
-	// Start a goroutine that waits for data
 	got := make(chan struct{})
 	go func() {
 		ch := p.WaitForData()
-		<-ch // blocks until data arrives
+		<-ch
 		close(got)
 	}()
 
-	// Give the goroutine time to start waiting
 	time.Sleep(50 * time.Millisecond)
-
-	// Produce a message — should unblock the waiter
 	p.Append("", "wake up!")
 
 	select {
 	case <-got:
-		// success — waiter was notified
 	case <-time.After(2 * time.Second):
 		t.Fatal("long-poll waiter was not notified within 2 seconds")
 	}

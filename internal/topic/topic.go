@@ -23,25 +23,24 @@ type Topic struct {
 	roundRobin uint64 // atomic counter for round-robin partition selection
 }
 
-// NewTopic creates a topic with the given number of partitions.
-// Returns an error if the name is invalid or partition count is out of range.
-func NewTopic(name string, numPartitions int) (*Topic, error) {
+// ValidateTopicParams checks topic name and partition count.
+func ValidateTopicParams(name string, numPartitions int) error {
 	if !validTopicName.MatchString(name) {
-		return nil, &common.ValidationError{Message: "invalid topic name: must be alphanumeric+hyphens, 1-255 chars"}
+		return &common.ValidationError{Message: "invalid topic name: must be alphanumeric+hyphens, 1-255 chars"}
 	}
 	if numPartitions <= 0 || numPartitions > 1024 {
-		return nil, &common.ValidationError{Message: "partition count must be between 1 and 1024"}
+		return &common.ValidationError{Message: "partition count must be between 1 and 1024"}
 	}
+	return nil
+}
 
-	partitions := make([]*Partition, numPartitions)
-	for i := 0; i < numPartitions; i++ {
-		partitions[i] = NewPartition(i)
-	}
-
+// NewTopic creates a topic with pre-built partitions.
+// The caller (broker) is responsible for creating partitions with the right store.
+func NewTopic(name string, partitions []*Partition) *Topic {
 	return &Topic{
 		Name:       name,
 		Partitions: partitions,
-	}, nil
+	}
 }
 
 // GetPartition returns the partition at the given index.

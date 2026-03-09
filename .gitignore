@@ -9,3 +9,7 @@ DESIGN_DECISIONS.md
 *.test
 *.out
 vendor/
+data/
+*.sqlog
+*.sqidx
+STORY.md
