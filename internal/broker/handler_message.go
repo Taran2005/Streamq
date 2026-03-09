@@ -47,7 +47,11 @@ func (s *Server) produceMessage(w http.ResponseWriter, r *http.Request) {
 		partition = t.NextPartition()
 	}
 
-	offset := partition.Append(req.Key, req.Value)
+	offset, err := partition.Append(req.Key, req.Value)
+	if err != nil {
+		common.WriteError(w, http.StatusInternalServerError, "failed to store message: "+err.Error())
+		return
+	}
 
 	common.WriteJSON(w, http.StatusOK, map[string]any{
 		"topic":     topicName,
@@ -135,7 +139,11 @@ func (s *Server) consumeMessages(w http.ResponseWriter, r *http.Request) {
 	// a producer appends between our Read and WaitForData — if we grabbed
 	// the channel after, we'd get the new (unclosed) channel and miss the data.
 	notifyCh := p.WaitForData()
-	messages := p.Read(params.Offset, params.MaxMessages)
+	messages, err := p.Read(params.Offset, params.MaxMessages)
+	if err != nil {
+		common.WriteError(w, http.StatusInternalServerError, "read failed: "+err.Error())
+		return
+	}
 
 	if len(messages) == 0 && params.Timeout > 0 {
 		timer := time.NewTimer(params.Timeout)
@@ -143,7 +151,11 @@ func (s *Server) consumeMessages(w http.ResponseWriter, r *http.Request) {
 
 		select {
 		case <-notifyCh:
-			messages = p.Read(params.Offset, params.MaxMessages)
+			messages, err = p.Read(params.Offset, params.MaxMessages)
+			if err != nil {
+				common.WriteError(w, http.StatusInternalServerError, "read failed: "+err.Error())
+				return
+			}
 		case <-timer.C:
 		case <-r.Context().Done():
 			return
