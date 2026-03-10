@@ -6,10 +6,10 @@ type Config struct {
 	DataDir          string // directory for persistent storage ("" = in-memory only)
 	MaxSegmentBytes  int64  // max size per segment file before rolling
 
-	// Durability: data is fsync'd on broker shutdown (Close).
-	// Unsynced data (in OS page cache) can be lost on power failure.
-	// Phase 2 tradeoff: we accept this for write throughput.
-	// Phase 7 adds configurable fsync batching (every N ms or N messages).
+	// Cluster mode (all empty = standalone mode)
+	BrokerID      string   // unique ID for this broker in the cluster
+	AdvertiseAddr string   // address other brokers use to reach us (e.g. "http://localhost:8081")
+	EtcdEndpoints []string // etcd cluster endpoints (e.g. ["localhost:2379"])
 }
 
 func DefaultConfig() Config {
@@ -19,4 +19,9 @@ func DefaultConfig() Config {
 		DataDir:         "",         // empty = in-memory mode
 		MaxSegmentBytes: 10_485_760, // 10MB per segment
 	}
+}
+
+// IsClusterMode returns true if etcd endpoints are configured.
+func (c Config) IsClusterMode() bool {
+	return len(c.EtcdEndpoints) > 0
 }
