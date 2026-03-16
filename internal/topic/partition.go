@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -34,8 +35,17 @@ func NewPartition(id int, store Store) *Partition {
 	}
 }
 
+// IsLocal returns true if this partition has a local store (not a remote placeholder).
+func (p *Partition) IsLocal() bool {
+	return p.store != nil
+}
+
 // Append adds a message to the partition via the store.
 func (p *Partition) Append(key, value string) (uint64, error) {
+	if p.store == nil {
+		return 0, fmt.Errorf("partition %d is remote (no local store)", p.ID)
+	}
+
 	msg := Message{
 		Key:       key,
 		Value:     value,
@@ -60,11 +70,17 @@ func (p *Partition) Append(key, value string) (uint64, error) {
 
 // Read returns messages starting from the given offset.
 func (p *Partition) Read(offset uint64, maxMessages int) ([]Message, error) {
+	if p.store == nil {
+		return nil, fmt.Errorf("partition %d is remote (no local store)", p.ID)
+	}
 	return p.store.Read(offset, maxMessages)
 }
 
 // LatestOffset returns the next offset that would be assigned.
 func (p *Partition) LatestOffset() uint64 {
+	if p.store == nil {
+		return 0
+	}
 	return p.store.LatestOffset()
 }
 
@@ -77,5 +93,8 @@ func (p *Partition) WaitForData() <-chan struct{} {
 
 // Close closes the underlying store.
 func (p *Partition) Close() error {
+	if p.store == nil {
+		return nil
+	}
 	return p.store.Close()
 }
