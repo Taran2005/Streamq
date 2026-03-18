@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/streamq/streamq/internal/cluster"
 	"github.com/streamq/streamq/internal/common"
-	"github.com/streamq/streamq/internal/topic"
 )
 
 func (s *Server) produceMessage(w http.ResponseWriter, r *http.Request) {
@@ -37,14 +37,29 @@ func (s *Server) produceMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var partition *topic.Partition
+	// Pick partition
+	var partitionID int
 	if req.Key != "" {
 		h := fnv.New64a()
 		h.Write([]byte(req.Key))
-		idx := int(h.Sum64() % uint64(len(t.Partitions)))
-		partition = t.Partitions[idx]
+		partitionID = int(h.Sum64() % uint64(len(t.Partitions)))
 	} else {
-		partition = t.NextPartition()
+		p := t.NextPartition()
+		partitionID = p.ID
+	}
+
+	// In cluster mode, check if we own this partition
+	if s.broker.Config.IsClusterMode() && !cluster.IsForwarded(r) {
+		if !s.broker.IsPartitionLocal(topicName, partitionID) {
+			s.forwardRequest(w, r, topicName, partitionID)
+			return
+		}
+	}
+
+	partition, err := t.GetPartition(partitionID)
+	if err != nil {
+		common.WriteAppError(w, err)
+		return
 	}
 
 	offset, err := partition.Append(req.Key, req.Value)
@@ -55,13 +70,12 @@ func (s *Server) produceMessage(w http.ResponseWriter, r *http.Request) {
 
 	common.WriteJSON(w, http.StatusOK, map[string]any{
 		"topic":     topicName,
-		"partition": partition.ID,
+		"partition": partitionID,
 		"offset":    offset,
 	})
 }
 
 // consumeParams holds parsed + validated query params for consume requests.
-// Keeps the handler clean — parsing is separate from business logic.
 type consumeParams struct {
 	Partition   int
 	Offset      uint64
@@ -117,13 +131,23 @@ func parseConsumeParams(r *http.Request) (consumeParams, error) {
 }
 
 func (s *Server) consumeMessages(w http.ResponseWriter, r *http.Request) {
+	topicName := r.PathValue("name")
+
 	params, err := parseConsumeParams(r)
 	if err != nil {
 		common.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	t, err := s.broker.GetTopic(r.PathValue("name"))
+	// In cluster mode, check if we own this partition
+	if s.broker.Config.IsClusterMode() && !cluster.IsForwarded(r) {
+		if !s.broker.IsPartitionLocal(topicName, params.Partition) {
+			s.forwardRequest(w, r, topicName, params.Partition)
+			return
+		}
+	}
+
+	t, err := s.broker.GetTopic(topicName)
 	if err != nil {
 		common.WriteAppError(w, err)
 		return
@@ -135,9 +159,6 @@ func (s *Server) consumeMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Grab the notify channel BEFORE reading. This prevents a race where
-	// a producer appends between our Read and WaitForData — if we grabbed
-	// the channel after, we'd get the new (unclosed) channel and miss the data.
 	notifyCh := p.WaitForData()
 	messages, err := p.Read(params.Offset, params.MaxMessages)
 	if err != nil {
@@ -165,4 +186,24 @@ func (s *Server) consumeMessages(w http.ResponseWriter, r *http.Request) {
 	common.WriteJSON(w, http.StatusOK, map[string]any{
 		"messages": messages,
 	})
+}
+
+// forwardRequest forwards a produce/consume request to the broker that owns the partition.
+func (s *Server) forwardRequest(w http.ResponseWriter, r *http.Request, topicName string, partition int) {
+	ownerID, ok := s.broker.GetPartitionOwner(topicName, partition)
+	if !ok {
+		common.WriteError(w, http.StatusInternalServerError, "no owner for partition")
+		return
+	}
+
+	body, statusCode, err := s.broker.forwarder.Forward(ownerID, r)
+	if err != nil {
+		common.WriteError(w, http.StatusBadGateway, "forward failed: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-StreamQ-Forwarded-From", s.broker.Config.BrokerID)
+	w.WriteHeader(statusCode)
+	w.Write(body)
 }
