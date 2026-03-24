@@ -172,7 +172,10 @@ func TestKeyBasedPartitioning(t *testing.T) {
 func TestTopicNotFound(t *testing.T) {
 	ts, _ := setupTestServer(t)
 
-	resp, _ := http.Get(ts.URL + "/topics/nope/messages?partition=0")
+	resp, err := http.Get(ts.URL + "/topics/nope/messages?partition=0")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", resp.StatusCode)
