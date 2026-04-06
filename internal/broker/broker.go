@@ -112,7 +112,11 @@ func (b *Broker) CreateTopic(ctx context.Context, name string, numPartitions int
 
 	// Assign partitions across brokers
 	brokers := b.cluster.GetBrokers()
-	assignments, err := b.assignments.AssignPartitions(ctx, name, numPartitions, brokers)
+	rf := b.Config.ReplicationFactor
+	if rf <= 0 {
+		rf = 1
+	}
+	assignments, err := b.assignments.AssignPartitions(ctx, name, numPartitions, rf, brokers)
 	if err != nil {
 		return nil, fmt.Errorf("assign partitions: %w", err)
 	}
@@ -123,6 +127,10 @@ func (b *Broker) CreateTopic(ctx context.Context, name string, numPartitions int
 
 // CreateTopicFromAssignment creates local partitions based on existing assignments.
 // Used by non-controller brokers when they learn about a new topic from etcd.
+//
+// With replication, ANY broker that holds a replica (leader or follower) gets
+// a real local store. Only brokers that hold no replica at all get a remote
+// placeholder.
 func (b *Broker) CreateTopicFromAssignment(name string, numPartitions int) (*topic.Topic, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -131,24 +139,22 @@ func (b *Broker) CreateTopicFromAssignment(name string, numPartitions int) (*top
 		return b.topics[name], nil
 	}
 
-	assignments := b.assignments.GetTopicAssignments(name)
+	assignments := b.assignments.GetTopicFullAssignments(name)
 	if assignments == nil {
 		return nil, fmt.Errorf("no assignments found for topic %s", name)
 	}
 
 	partitions := make([]*topic.Partition, numPartitions)
 	for i := 0; i < numPartitions; i++ {
-		ownerID := assignments[i]
-		if ownerID == b.Config.BrokerID {
-			// We own this partition — create a real store
+		a, ok := assignments[i]
+		if ok && a.HasReplica(b.Config.BrokerID) {
 			store, err := b.createStore(name, i)
 			if err != nil {
 				return nil, fmt.Errorf("create store for partition %d: %w", i, err)
 			}
 			partitions[i] = topic.NewPartition(i, store)
 		} else {
-			// Remote partition — create a placeholder with nil store
-			// Reads/writes to this partition will be forwarded
+			// We don't hold a replica of this partition — placeholder.
 			partitions[i] = topic.NewPartition(i, nil)
 		}
 	}
@@ -186,14 +192,16 @@ func (b *Broker) createLocalTopic(name string, numPartitions int) (*topic.Topic,
 	return t, nil
 }
 
-// createPartitionsFromAssignment creates the topic and only the partitions we own.
+// createPartitionsFromAssignment creates the topic. Any partition for which
+// we are a replica (leader OR follower) gets a real local store; the rest get
+// remote placeholders.
 func (b *Broker) createPartitionsFromAssignment(name string, numPartitions int, assignments []cluster.PartitionAssignment) (*topic.Topic, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	partitions := make([]*topic.Partition, numPartitions)
 	for _, a := range assignments {
-		if a.BrokerID == b.Config.BrokerID {
+		if a.HasReplica(b.Config.BrokerID) {
 			store, err := b.createStore(name, a.Partition)
 			if err != nil {
 				// Clean up already-created partitions

@@ -117,7 +117,7 @@ func TestPartitionAssignment(t *testing.T) {
 		{ID: "b3", Addr: "http://localhost:8083"},
 	}
 
-	assignments, err := am.AssignPartitions(ctx, "orders", 6, brokers)
+	assignments, err := am.AssignPartitions(ctx, "orders", 6, 1, brokers)
 	if err != nil {
 		t.Fatalf("assign partitions: %v", err)
 	}
@@ -128,8 +128,8 @@ func TestPartitionAssignment(t *testing.T) {
 
 	// Every partition should be assigned to some broker
 	for _, a := range assignments {
-		if a.BrokerID == "" {
-			t.Errorf("partition %d has no broker", a.Partition)
+		if a.Leader == "" {
+			t.Errorf("partition %d has no leader", a.Partition)
 		}
 	}
 
@@ -138,17 +138,60 @@ func TestPartitionAssignment(t *testing.T) {
 	if !ok {
 		t.Fatal("partition 0 not found")
 	}
-	if ownerID != assignments[0].BrokerID {
-		t.Errorf("partition 0 owner mismatch: %s vs %s", ownerID, assignments[0].BrokerID)
+	if ownerID != assignments[0].Leader {
+		t.Errorf("partition 0 leader mismatch: %s vs %s", ownerID, assignments[0].Leader)
 	}
 
 	// Verify assignments spread across brokers (with 6 partitions and 3 brokers)
 	counts := make(map[string]int)
 	for _, a := range assignments {
-		counts[a.BrokerID]++
+		counts[a.Leader]++
 	}
 	if len(counts) < 2 {
 		t.Errorf("assignments not spread well: %v", counts)
+	}
+}
+
+func TestReplicaAssignment(t *testing.T) {
+	client := requireEtcd(t)
+
+	am := NewAssignmentManager(client)
+	ctx := context.Background()
+	if err := am.Start(ctx); err != nil {
+		t.Fatalf("start assignment manager: %v", err)
+	}
+	defer am.Stop()
+
+	brokers := []BrokerInfo{
+		{ID: "b1", Addr: "http://localhost:8081"},
+		{ID: "b2", Addr: "http://localhost:8082"},
+		{ID: "b3", Addr: "http://localhost:8083"},
+	}
+
+	assignments, err := am.AssignPartitions(ctx, "rfttest", 3, 3, brokers)
+	if err != nil {
+		t.Fatalf("assign partitions: %v", err)
+	}
+
+	for _, a := range assignments {
+		if len(a.Replicas) != 3 {
+			t.Errorf("partition %d: expected 3 replicas, got %d (%v)", a.Partition, len(a.Replicas), a.Replicas)
+		}
+		if len(a.ISR) != 3 {
+			t.Errorf("partition %d: expected ISR=3, got %d", a.Partition, len(a.ISR))
+		}
+		if !a.HasReplica(a.Leader) {
+			t.Errorf("partition %d: leader %s not in replicas %v", a.Partition, a.Leader, a.Replicas)
+		}
+	}
+
+	// rf capped at #brokers
+	a2, err := am.AssignPartitions(ctx, "rfttest2", 1, 99, brokers)
+	if err != nil {
+		t.Fatalf("assign partitions rf=99: %v", err)
+	}
+	if len(a2[0].Replicas) != 3 {
+		t.Errorf("expected rf capped to 3, got %d", len(a2[0].Replicas))
 	}
 }
 
