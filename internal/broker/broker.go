@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/streamq/streamq/internal/cluster"
 	"github.com/streamq/streamq/internal/common"
@@ -24,12 +26,28 @@ type Broker struct {
 	cluster     *cluster.Cluster
 	assignments *cluster.AssignmentManager
 	forwarder   *cluster.Forwarder
+	replicator  *cluster.Replicator
+
+	// Replication state
+	leaderStates    *LeaderStateRegistry
+	partitionMgrs   map[string]map[int]*partitionRuntime // topic → partition → runtime
+	pmMu            sync.Mutex
+	shuttingDown    atomic.Bool
+	replicateWG     sync.WaitGroup
 }
 
 func New(cfg Config) (*Broker, error) {
+	if cfg.InternalToken == "" {
+		cfg.InternalToken = "dev"
+	}
+	if v := os.Getenv("STREAMQ_INTERNAL_TOKEN"); v != "" {
+		cfg.InternalToken = v
+	}
+
 	b := &Broker{
-		Config: cfg,
-		topics: make(map[string]*topic.Topic),
+		Config:        cfg,
+		topics:        make(map[string]*topic.Topic),
+		partitionMgrs: make(map[string]map[int]*partitionRuntime),
 	}
 
 	if cfg.DataDir != "" {
@@ -68,9 +86,45 @@ func (b *Broker) JoinCluster() error {
 	}
 
 	b.forwarder = cluster.NewForwarder(c)
+	b.replicator = cluster.NewReplicator(b.Config.BrokerID, b.forwarder, b.Config.InternalToken)
+
+	// Leader state tracker (ISR loop)
+	b.leaderStates = newLeaderStateRegistry(b)
+	go b.leaderStates.Run(context.Background())
+
+	// React to assignment changes — start/stop follower loops and partition
+	// electors as replicas come and go.
+	b.assignments.OnChange(b.onAssignmentChange)
 
 	log.Printf("joined cluster as broker %s", b.Config.BrokerID)
 	return nil
+}
+
+// onAssignmentChange is the watcher callback. It reconciles partition runtimes
+// (elector, follower loop) against the new assignment. Cheap and safe to call
+// repeatedly — partitionRuntime starts everything idempotently.
+func (b *Broker) onAssignmentChange(a cluster.PartitionAssignment) {
+	if !a.HasReplica(b.Config.BrokerID) {
+		// We're not a replica — make sure nothing is running.
+		b.stopPartitionRuntime(a.Topic, a.Partition)
+		return
+	}
+
+	// We're a replica. Ensure local topic + partition exist (lazy create).
+	if _, err := b.GetTopic(a.Topic); err != nil {
+		// Topic may not be cached yet; if assignments know about it,
+		// CreateTopicFromAssignment will be called by the next GetTopic.
+		// Try once more.
+		count := b.assignments.TopicPartitionCount(a.Topic)
+		if count > 0 {
+			if _, cerr := b.CreateTopicFromAssignment(a.Topic, count); cerr != nil {
+				log.Printf("onAssignmentChange %s/%d: create topic: %v", a.Topic, a.Partition, cerr)
+				return
+			}
+		}
+	}
+
+	b.ensurePartitionRuntime(a.Topic, a.Partition)
 }
 
 // ErrNotController is returned when a non-controller broker receives a request
@@ -278,6 +332,13 @@ func (b *Broker) ListTopics() []topic.TopicInfo {
 
 // Close shuts down all topics, stores, and cluster connection.
 func (b *Broker) Close() error {
+	// Stop all partition runtimes (electors + follower loops) first.
+	b.stopAllPartitionRuntimes()
+
+	if b.leaderStates != nil {
+		b.leaderStates.Stop()
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -300,6 +361,86 @@ func (b *Broker) Close() error {
 	}
 
 	return firstErr
+}
+
+// IsShuttingDown reports whether graceful shutdown has been initiated. Used
+// by handlers to reject new produce traffic.
+func (b *Broker) IsShuttingDown() bool {
+	return b.shuttingDown.Load()
+}
+
+// Shutdown performs ordered graceful shutdown: leadership transfer, drain,
+// then close. Called by cmd/broker on SIGTERM before Server.Shutdown +
+// Broker.Close.
+//
+// Sequence:
+//  1. Mark broker as shutting-down so new produces return 503.
+//  2. For each partition we lead: pick most-caught-up ISR member, resign
+//     election, wait briefly for the new leader to register.
+//  3. Wait up to 2s for in-flight replication pushes to drain.
+//
+// Caller is still responsible for HTTP server shutdown and Close().
+func (b *Broker) Shutdown(ctx context.Context) error {
+	if !b.Config.IsClusterMode() {
+		return nil
+	}
+	b.shuttingDown.Store(true)
+
+	// Resign every partition we currently lead.
+	b.pmMu.Lock()
+	var resignTargets []*partitionRuntime
+	for _, parts := range b.partitionMgrs {
+		for _, pr := range parts {
+			if pr.elector != nil && pr.elector.IsLeader() {
+				resignTargets = append(resignTargets, pr)
+			}
+		}
+	}
+	b.pmMu.Unlock()
+
+	for _, pr := range resignTargets {
+		rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
+		if err := pr.elector.Resign(rctx); err != nil {
+			log.Printf("shutdown: resign %s/%d: %v", pr.topic, pr.partition, err)
+		}
+		rcancel()
+		// Best-effort wait for someone else to win.
+		waitCtx, wcancel := context.WithTimeout(ctx, 2*time.Second)
+		b.waitForNewLeader(waitCtx, pr.topic, pr.partition)
+		wcancel()
+	}
+
+	// Wait for in-flight replication pushes to drain.
+	drainCh := make(chan struct{})
+	go func() {
+		b.replicateWG.Wait()
+		close(drainCh)
+	}()
+	select {
+	case <-drainCh:
+	case <-time.After(2 * time.Second):
+		log.Printf("shutdown: replication drain timed out")
+	case <-ctx.Done():
+	}
+
+	return nil
+}
+
+// waitForNewLeader polls the assignment until Leader != self or ctx expires.
+func (b *Broker) waitForNewLeader(ctx context.Context, topicName string, partition int) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		a, ok := b.assignments.GetAssignment(topicName, partition)
+		if ok && a.Leader != "" && a.Leader != b.Config.BrokerID {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // recoverFromDisk scans the data directory and re-registers topics/partitions.

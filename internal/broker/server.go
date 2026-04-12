@@ -25,6 +25,11 @@ func NewServer(b *Broker) *Server {
 	mux.HandleFunc("GET /topics/{name}/messages", s.consumeMessages)
 	mux.HandleFunc("GET /metadata", s.getMetadata)
 
+	// Internal replication endpoints (leader→follower push + follower→leader pull).
+	// Auth is by X-StreamQ-Internal header; see handler_replication.go.
+	mux.HandleFunc("POST /internal/replicate/{topic}/{partition}", s.replicatePush)
+	mux.HandleFunc("GET /internal/follow/{topic}/{partition}", s.replicateFollow)
+
 	s.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", b.Config.Port),
 		Handler: mux,
