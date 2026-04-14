@@ -160,7 +160,10 @@ func (s *Server) consumeMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	notifyCh := p.WaitForData()
-	messages, err := p.Read(params.Offset, params.MaxMessages)
+	// ReadVisible gates reads at the high watermark so consumers never see
+	// tail messages that haven't been replicated yet. In standalone mode HW
+	// equals LatestOffset (set on every leader append), so this is a no-op.
+	messages, err := p.ReadVisible(params.Offset, params.MaxMessages)
 	if err != nil {
 		common.WriteError(w, http.StatusInternalServerError, "read failed: "+err.Error())
 		return
@@ -172,7 +175,7 @@ func (s *Server) consumeMessages(w http.ResponseWriter, r *http.Request) {
 
 		select {
 		case <-notifyCh:
-			messages, err = p.Read(params.Offset, params.MaxMessages)
+			messages, err = p.ReadVisible(params.Offset, params.MaxMessages)
 			if err != nil {
 				common.WriteError(w, http.StatusInternalServerError, "read failed: "+err.Error())
 				return
