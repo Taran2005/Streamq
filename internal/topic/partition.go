@@ -51,8 +51,17 @@ func (p *Partition) IsLocal() bool {
 
 // Append adds a message to the partition via the store.
 func (p *Partition) Append(key, value string) (uint64, error) {
+	_, off, err := p.AppendAndReturn(key, value)
+	return off, err
+}
+
+// AppendAndReturn appends like Append, but also returns the materialized
+// Message (with offset and timestamp set) so the caller can replicate it to
+// followers. Added in Phase 4 to support leader→follower push; we keep the
+// old Append signature so non-cluster callers don't have to change.
+func (p *Partition) AppendAndReturn(key, value string) (Message, uint64, error) {
 	if p.store == nil {
-		return 0, fmt.Errorf("partition %d is remote (no local store)", p.ID)
+		return Message{}, 0, fmt.Errorf("partition %d is remote (no local store)", p.ID)
 	}
 
 	msg := Message{
@@ -64,11 +73,12 @@ func (p *Partition) Append(key, value string) (uint64, error) {
 
 	offset, err := p.store.Append(msg)
 	if err != nil {
-		return 0, err
+		return Message{}, 0, err
 	}
+	msg.Offset = offset
 
 	p.broadcastNewData()
-	return offset, nil
+	return msg, offset, nil
 }
 
 // AppendReplicated writes a pre-stamped message from the leader to a follower's
