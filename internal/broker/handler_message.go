@@ -154,10 +154,14 @@ func (s *Server) replicateSync(ctx context.Context, topicName string, partition 
 	}
 	for _, f := range followers {
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := s.broker.replicator.Push(pctx, f, topicName, partition, msgs)
+		hw, err := s.broker.replicator.Push(pctx, f, topicName, partition, msgs)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("%w: %v", errInsufficientISR, err)
+		}
+		// Follower accepted the batch — note its new offset for ISR tracking.
+		if s.broker.leaderStates != nil {
+			s.broker.leaderStates.noteFollowerSeen(topicName, partition, f, hw, time.Now())
 		}
 	}
 	return nil
@@ -172,16 +176,16 @@ func (s *Server) replicateBestEffort(ctx context.Context, topicName string, part
 	}
 	followers := s.broker.leaderStates.allReplicas(topicName, partition)
 	for _, f := range followers {
-		_, err := s.broker.replicator.Push(ctx, f, topicName, partition, msgs)
+		hw, err := s.broker.replicator.Push(ctx, f, topicName, partition, msgs)
 		if err != nil {
-			// Out-of-sync: follower will catch up via /internal/follow loop.
-			// Other errors logged for visibility.
+			// Out-of-sync: follower will catch up via /internal/follow loop —
+			// expected, not noisy. Other errors get swallowed too because
+			// this is best-effort by design.
 			var outOfSync *cluster.ErrFollowerOutOfSync
-			if !errors.As(err, &outOfSync) {
-				// Drop the noise of out-of-sync; treat as expected.
-			}
-			_ = err // intentional swallow — best effort
+			_ = errors.As(err, &outOfSync)
+			continue
 		}
+		s.broker.leaderStates.noteFollowerSeen(topicName, partition, f, hw, time.Now())
 	}
 }
 
