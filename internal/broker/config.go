@@ -19,6 +19,9 @@ type Config struct {
 	MaxLagMessages    uint64        // followers more than N messages behind drop out of ISR
 	MaxLagDuration    time.Duration // followers not seen in this long drop out of ISR
 	ShutdownTimeout   time.Duration // hard cap on graceful shutdown
+
+	// Consumer groups (Phase 5)
+	OffsetTopicPartitions int // partition count for the internal __consumer_offsets topic
 }
 
 func DefaultConfig() Config {
@@ -29,9 +32,10 @@ func DefaultConfig() Config {
 		MaxSegmentBytes:   10_485_760, // 10MB per segment
 		ReplicationFactor: 3,
 		InternalToken:     "dev", // override via STREAMQ_INTERNAL_TOKEN
-		MaxLagMessages:    100,
-		MaxLagDuration:    10 * time.Second,
-		ShutdownTimeout:   10 * time.Second,
+		MaxLagMessages:        100,
+		MaxLagDuration:        10 * time.Second,
+		ShutdownTimeout:       10 * time.Second,
+		OffsetTopicPartitions: 8,
 	}
 }
 

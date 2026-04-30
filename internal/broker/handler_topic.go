@@ -7,6 +7,7 @@ import (
 
 	"github.com/streamq/streamq/internal/cluster"
 	"github.com/streamq/streamq/internal/common"
+	"github.com/streamq/streamq/internal/topic"
 )
 
 func (s *Server) createTopic(w http.ResponseWriter, r *http.Request) {
@@ -22,6 +23,12 @@ func (s *Server) createTopic(w http.ResponseWriter, r *http.Request) {
 
 	if req.Name == "" {
 		common.WriteError(w, http.StatusBadRequest, "topic name is required")
+		return
+	}
+	// Reserved-prefix topics are managed by the broker; the public create
+	// endpoint never accepts them.
+	if topic.IsReservedName(req.Name) {
+		common.WriteError(w, http.StatusBadRequest, "topic names starting with '__' are reserved")
 		return
 	}
 
@@ -53,7 +60,13 @@ func (s *Server) createTopic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listTopics(w http.ResponseWriter, r *http.Request) {
-	topics := s.broker.ListTopics()
+	includeInternal := r.URL.Query().Get("internal") == "true"
+	var topics any
+	if includeInternal {
+		topics = s.broker.ListAllTopics()
+	} else {
+		topics = s.broker.ListTopics()
+	}
 	common.WriteJSON(w, http.StatusOK, map[string]any{
 		"topics": topics,
 	})

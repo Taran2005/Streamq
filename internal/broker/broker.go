@@ -34,6 +34,10 @@ type Broker struct {
 	pmMu            sync.Mutex
 	shuttingDown    atomic.Bool
 	replicateWG     sync.WaitGroup
+
+	// Consumer groups (Phase 5). Initialized lazily on first use in standalone
+	// mode and on JoinCluster in cluster mode.
+	groups *groupSubsystem
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -54,6 +58,14 @@ func New(cfg Config) (*Broker, error) {
 		if err := b.recoverFromDisk(); err != nil {
 			return nil, fmt.Errorf("recovery failed: %w", err)
 		}
+	}
+
+	// Initialize the consumer-group subsystem in standalone mode immediately.
+	// Cluster mode defers this to JoinCluster (we need cluster wiring to
+	// route group requests across brokers).
+	if !cfg.IsClusterMode() {
+		b.initGroupSubsystem()
+		b.replayOffsetsTopic()
 	}
 
 	return b, nil
@@ -95,6 +107,13 @@ func (b *Broker) JoinCluster() error {
 	// React to assignment changes — start/stop follower loops and partition
 	// electors as replicas come and go.
 	b.assignments.OnChange(b.onAssignmentChange)
+
+	// Bring up the consumer-group subsystem. In cluster mode the offsets
+	// topic is created (controller) or discovered (non-controller) lazily —
+	// any broker can host a coordinator for groups whose offsets partition
+	// it leads.
+	b.initGroupSubsystem()
+	b.replayOffsetsTopic()
 
 	log.Printf("joined cluster as broker %s", b.Config.BrokerID)
 	return nil
@@ -319,7 +338,26 @@ func (b *Broker) GetTopic(name string) (*topic.Topic, error) {
 	return nil, &common.NotFoundError{Resource: "topic", Name: name}
 }
 
+// ListTopics returns user-visible topics. Internal topics (names beginning
+// with "__") are hidden by default — callers that want them call
+// ListAllTopics instead.
 func (b *Broker) ListTopics() []topic.TopicInfo {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	infos := make([]topic.TopicInfo, 0, len(b.topics))
+	for name, t := range b.topics {
+		if isInternalTopic(name) {
+			continue
+		}
+		infos = append(infos, t.Info())
+	}
+	return infos
+}
+
+// ListAllTopics returns every topic including internal ones (__consumer_offsets,
+// __dlq.*). Used when the API caller passes ?internal=true.
+func (b *Broker) ListAllTopics() []topic.TopicInfo {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -330,6 +368,12 @@ func (b *Broker) ListTopics() []topic.TopicInfo {
 	return infos
 }
 
+// isInternalTopic returns true if the topic name is reserved for broker-
+// internal data (consumer offsets, DLQs).
+func isInternalTopic(name string) bool {
+	return len(name) >= 2 && name[0] == '_' && name[1] == '_'
+}
+
 // Close shuts down all topics, stores, and cluster connection.
 func (b *Broker) Close() error {
 	// Stop all partition runtimes (electors + follower loops) first.
@@ -337,6 +381,10 @@ func (b *Broker) Close() error {
 
 	if b.leaderStates != nil {
 		b.leaderStates.Stop()
+	}
+
+	if b.groups != nil && b.groups.coordinator != nil {
+		b.groups.coordinator.Stop()
 	}
 
 	b.mu.Lock()
