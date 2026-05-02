@@ -30,6 +30,17 @@ func NewServer(b *Broker) *Server {
 	mux.HandleFunc("POST /internal/replicate/{topic}/{partition}", s.replicatePush)
 	mux.HandleFunc("GET /internal/follow/{topic}/{partition}", s.replicateFollow)
 
+	// Consumer group endpoints (Phase 5). Coordinator routing is handled inside
+	// each handler so non-coordinator brokers transparently forward.
+	mux.HandleFunc("POST /groups/{group}/join", s.joinGroup)
+	mux.HandleFunc("POST /groups/{group}/heartbeat", s.heartbeatGroup)
+	mux.HandleFunc("POST /groups/{group}/leave", s.leaveGroup)
+	mux.HandleFunc("POST /groups/{group}/commit", s.commitGroup)
+	mux.HandleFunc("GET /groups/{group}/offsets", s.listGroupOffsets)
+	mux.HandleFunc("POST /groups/{group}/dlq", s.dlqGroup)
+	mux.HandleFunc("GET /groups/{group}", s.describeGroup)
+	mux.HandleFunc("GET /groups", s.listGroups)
+
 	s.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", b.Config.Port),
 		Handler: mux,
