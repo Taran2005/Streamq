@@ -228,6 +228,27 @@ func (b *Broker) IsCoordinatorFor(group string) bool {
 	return id == b.Config.BrokerID
 }
 
+// CoordinatorBrokerFor exposes the routing decision for the given group.
+// Used by external tests and admin tooling.
+func (b *Broker) CoordinatorBrokerFor(group string) (string, bool) {
+	return b.coordinatorBrokerFor(group)
+}
+
+// LookupCommittedOffset returns the last committed offset stored locally for
+// the (group, topic, partition) row. Returns (0, false) if no such commit was
+// ever applied on this broker. Used by tests and admin tools to verify that a
+// coordinator has accepted a commit without poking at internal state.
+func (b *Broker) LookupCommittedOffset(group, topicName string, partition int) (uint64, bool) {
+	if b.groups == nil || b.groups.store == nil {
+		return 0, false
+	}
+	rec, ok := b.groups.store.Lookup(group, topicName, partition)
+	if !ok {
+		return 0, false
+	}
+	return rec.Offset, true
+}
+
 // _ = ensure unused imports don't bite us if the file changes.
 var (
 	_ = fnv.New64a
