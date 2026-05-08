@@ -8,6 +8,8 @@
 //   partitions list | reassign
 //   produce
 //   consume
+//   consume-group
+//   groups list | describe | offsets | dlq
 //
 // Most subcommands talk to a broker over its HTTP API. The `partitions`
 // subcommand talks to etcd directly so we can inspect/edit assignments
@@ -25,13 +27,18 @@ Usage:
   streamq-cli <command> [subcommand] [flags]
 
 Commands:
-  topic create      Create a topic (HTTP)
-  topic list        List topics (HTTP)
-  topic describe    Show partition->broker map for a topic (HTTP /metadata)
-  partitions list   List all partition assignments from etcd
-  partitions reassign  Reassign a partition to a different broker (etcd write)
-  produce           Send a single message (HTTP)
-  consume           Read messages from a partition (HTTP)
+  topic create        Create a topic (HTTP)
+  topic list          List topics (HTTP)
+  topic describe      Show partition->broker map for a topic (HTTP /metadata)
+  partitions list     List all partition assignments from etcd
+  partitions reassign Reassign a partition to a different broker (etcd write)
+  produce             Send a single message (HTTP)
+  consume             Read messages from a partition (HTTP)
+  consume-group       Join a consumer group and stream messages with offset commits
+  groups list         List active consumer groups
+  groups describe     Show membership and assignment for one group
+  groups offsets      Show committed offsets for one group
+  groups dlq          Send a poisoned message to its DLQ topic
 
 Run "streamq-cli <command> --help" for flags.
 `
@@ -54,6 +61,10 @@ func main() {
 		runProduce(os.Args[2:])
 	case "consume":
 		runConsume(os.Args[2:])
+	case "consume-group":
+		runConsumeGroup(os.Args[2:])
+	case "groups":
+		runGroups(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		fmt.Fprint(os.Stderr, usage)
