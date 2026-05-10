@@ -202,9 +202,10 @@ func TestCoordinator_CommitWrongGeneration(t *testing.T) {
 func TestCoordinator_SessionTimeoutDropsMember(t *testing.T) {
 	c, _ := newTestCoord(t, map[string]int{"t": 2})
 
-	// Driveable clock.
-	now := time.Unix(1_000_000, 0)
-	c.SetClock(func() time.Time { return now })
+	// Driveable clock — wrapped so the session loop sees a consistent value
+	// when -race is enabled.
+	clock := &raceSafeClock{now: time.Unix(1_000_000, 0)}
+	c.SetClock(clock.Now)
 
 	res, _ := c.Join(context.Background(), JoinRequest{
 		GroupName:        "g",
@@ -213,7 +214,7 @@ func TestCoordinator_SessionTimeoutDropsMember(t *testing.T) {
 	})
 
 	// Advance past the session timeout.
-	now = now.Add(10 * time.Second)
+	clock.Advance(10 * time.Second)
 	c.Tick()
 
 	snap, ok := c.Describe("g")
@@ -289,6 +290,25 @@ func TestCoordinator_ListAndDescribe(t *testing.T) {
 	if _, ok := c.Describe("missing"); ok {
 		t.Fatal("expected describe miss")
 	}
+}
+
+// raceSafeClock is a tiny goroutine-safe time source so coordinator tests
+// pass under -race even when the session loop is reading it concurrently.
+type raceSafeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *raceSafeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *raceSafeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
 }
 
 func intsEqual(a, b []int) bool {

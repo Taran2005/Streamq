@@ -57,7 +57,9 @@ type Coordinator struct {
 	resolver TopicResolver
 	writer   OffsetWriter
 	store    *Store
-	clock    func() time.Time
+
+	clockMu sync.RWMutex
+	clockFn func() time.Time
 
 	mu     sync.Mutex
 	groups map[string]*Group
@@ -74,7 +76,7 @@ func NewCoordinator(resolver TopicResolver, writer OffsetWriter, store *Store) *
 		resolver: resolver,
 		writer:   writer,
 		store:    store,
-		clock:    time.Now,
+		clockFn:  time.Now,
 		groups:   make(map[string]*Group),
 		stopCh:   make(chan struct{}),
 	}
@@ -500,7 +502,17 @@ func (c *Coordinator) tick() {
 // SetClock overrides the time source. Tests use this to drive session
 // timeouts deterministically.
 func (c *Coordinator) SetClock(clock func() time.Time) {
-	c.clock = clock
+	c.clockMu.Lock()
+	c.clockFn = clock
+	c.clockMu.Unlock()
+}
+
+// clock returns the current "now". Indirected through a mutex so tests can
+// swap the time source while the session loop is running.
+func (c *Coordinator) clock() time.Time {
+	c.clockMu.RLock()
+	defer c.clockMu.RUnlock()
+	return c.clockFn()
 }
 
 // Tick exposes the internal tick for tests. Production code uses sessionLoop.

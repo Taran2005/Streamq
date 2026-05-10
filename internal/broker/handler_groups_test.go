@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // groupHTTP gives us a tiny test client that abstracts the JSON wrapping.
@@ -353,6 +355,65 @@ func TestGroup_InternalTopicHiddenFromListByDefault(t *testing.T) {
 	if !strings.Contains(string(body), "__consumer_offsets") {
 		t.Fatalf("expected __consumer_offsets visible with ?internal=true, got %s", body)
 	}
+}
+
+// TestGroup_SessionTimeoutDropsMemberHTTP drives the coordinator's session
+// monitor through the HTTP boundary. We pin a fake clock on the coordinator
+// directly so the test is deterministic; the membership drop should surface
+// via the describe endpoint.
+func TestGroup_SessionTimeoutDropsMemberHTTP(t *testing.T) {
+	h, b := newGroupHTTP(t)
+	h.do("POST", "/topics", map[string]any{"name": "t", "partitions": 1})
+
+	// Pin the coordinator clock so we can advance time deterministically. The
+	// background session loop reads this concurrently, so guard it with a
+	// mutex.
+	clock := &fakeClock{now: time.Now()}
+	b.groups.coordinator.SetClock(clock.Now)
+
+	status, body := h.do("POST", "/groups/g/join", map[string]any{
+		"topics":             []string{"t"},
+		"session_timeout_ms": 5_000,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("join: %d %s", status, body)
+	}
+
+	// Advance well past the session timeout and force a coordinator tick.
+	clock.Advance(10 * time.Second)
+	b.groups.coordinator.Tick()
+
+	// Describe should now show zero members.
+	status, body = h.do("GET", "/groups/g", nil)
+	if status != http.StatusOK {
+		t.Fatalf("describe: %d %s", status, body)
+	}
+	var desc struct {
+		Members []any `json:"members"`
+	}
+	_ = json.Unmarshal(body, &desc)
+	if len(desc.Members) != 0 {
+		t.Fatalf("expected member dropped after timeout, got %d", len(desc.Members))
+	}
+}
+
+// fakeClock is a goroutine-safe stand-in for time.Now used in tests that need
+// to step the coordinator's clock past a session timeout.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
 }
 
 func TestGroup_RecoverOffsetsOnRestart(t *testing.T) {
