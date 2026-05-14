@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -507,8 +506,3 @@ func splitNonEmpty(s, sep string) []string {
 	return out
 }
 
-// Wire dependencies for net/http and bytes that may appear unused if helpers
-// are inlined in future refactors.
-var (
-	_ = bytes.NewReader
-)

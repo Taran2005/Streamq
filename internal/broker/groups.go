@@ -2,16 +2,11 @@ package broker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"sync"
-	"time"
 
-	"github.com/streamq/streamq/internal/cluster"
 	"github.com/streamq/streamq/internal/consumergroup"
-	"github.com/streamq/streamq/internal/topic"
 )
 
 // brokerTopicResolver adapts *Broker to consumergroup.TopicResolver. The
@@ -249,11 +244,3 @@ func (b *Broker) LookupCommittedOffset(group, topicName string, partition int) (
 	return rec.Offset, true
 }
 
-// _ = ensure unused imports don't bite us if the file changes.
-var (
-	_ = fnv.New64a
-	_ = json.Marshal
-	_ = time.Now
-	_ = topic.Message{}
-	_ = cluster.InternalHeader
-)

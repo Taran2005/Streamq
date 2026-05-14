@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/streamq/streamq/internal/cluster"
 	"github.com/streamq/streamq/internal/common"
 	"github.com/streamq/streamq/internal/consumergroup"
 )
@@ -374,5 +373,3 @@ func (s *Server) describeGroup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// unused-import guard
-var _ = cluster.InternalHeader

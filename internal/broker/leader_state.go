@@ -6,8 +6,6 @@ import (
 	"sort"
 	"sync"
 	"time"
-
-	"github.com/streamq/streamq/internal/cluster"
 )
 
 // followerLag is the leader's view of a single follower for a single partition.
@@ -316,5 +314,3 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
-// ensure unused-import warnings don't bite if internalToken stays unused later
-var _ = cluster.InternalHeader
