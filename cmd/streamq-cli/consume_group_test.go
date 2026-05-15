@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -104,5 +105,115 @@ func TestNumericCoercion(t *testing.T) {
 	}
 	if asUint64(int(-1)) != 0 {
 		t.Fatal("negative int→0")
+	}
+}
+
+// TestCommit_NoLocalAdvanceOn426 covers the commit-ordering bug: when the
+// broker responds with 426 Upgrade Required, the CLI's local committed map
+// must NOT advance — the broker still owns the older offset. If we let the
+// local map race ahead, the next fetch after re-join skips past messages
+// that were never persisted (data loss).
+func TestCommit_NoLocalAdvanceOn426(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "rejoin", http.StatusUpgradeRequired)
+	}))
+	defer ts.Close()
+
+	c := &groupClient{
+		broker:    ts.URL,
+		group:     "g",
+		memberID:  "m1",
+		generation: 1,
+		committed: map[string]map[int]uint64{},
+	}
+
+	err := c.commit([]map[string]any{{"topic": "t", "partition": 0, "offset": uint64(99)}})
+	if !errors.Is(err, errNeedsRejoin) {
+		t.Fatalf("expected errNeedsRejoin, got %v", err)
+	}
+	// Critical: the local map MUST still be empty. If 99 made it in, the
+	// next fetch would skip offsets that were never committed.
+	if got, ok := c.lookupOffset("t", 0); ok {
+		t.Fatalf("local committed advanced on 426: got %d", got)
+	}
+}
+
+// TestCommit_LocalAdvanceOnSuccess is the positive side of the same bug:
+// when commit returns 2xx, the local map MUST move forward so a quick
+// in-process restart doesn't re-deliver.
+func TestCommit_LocalAdvanceOnSuccess(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer ts.Close()
+
+	c := &groupClient{
+		broker:     ts.URL,
+		group:      "g",
+		memberID:   "m1",
+		generation: 1,
+		committed:  map[string]map[int]uint64{},
+	}
+
+	if err := c.commit([]map[string]any{{"topic": "t", "partition": 0, "offset": uint64(42)}}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	got, ok := c.lookupOffset("t", 0)
+	if !ok || got != 42 {
+		t.Fatalf("expected local commit at 42, got %d ok=%v", got, ok)
+	}
+}
+
+// TestRefreshCommittedOffsets_404 makes sure a missing/erroring endpoint
+// returns an error rather than silently zero-ing the local cache. The old
+// code decoded the body regardless of status, so a 404 left the consumer
+// reading from offset 0 and re-delivering committed messages.
+func TestRefreshCommittedOffsets_404(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "missing", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	c := &groupClient{
+		broker: ts.URL,
+		group:  "g",
+		topics: []string{"t"},
+		// Pre-seed an offset so we can confirm the call doesn't blow it away.
+		committed: map[string]map[int]uint64{
+			"t": {0: 55},
+		},
+	}
+	err := c.refreshCommittedOffsets()
+	if err == nil {
+		t.Fatal("expected error on 404")
+	}
+	got, ok := c.lookupOffset("t", 0)
+	if !ok || got != 55 {
+		t.Fatalf("pre-seeded offset clobbered: got %d ok=%v", got, ok)
+	}
+}
+
+// TestRefreshCommittedOffsets_2xx confirms the happy path still populates
+// the local cache as before.
+func TestRefreshCommittedOffsets_2xx(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"offsets":[{"topic":"t","partition":0,"committed_offset":11}]}`))
+	}))
+	defer ts.Close()
+
+	c := &groupClient{
+		broker:    ts.URL,
+		group:     "g",
+		topics:    []string{"t"},
+		committed: map[string]map[int]uint64{},
+	}
+	if err := c.refreshCommittedOffsets(); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	got, ok := c.lookupOffset("t", 0)
+	if !ok || got != 11 {
+		t.Fatalf("expected refreshed offset 11, got %d ok=%v", got, ok)
 	}
 }

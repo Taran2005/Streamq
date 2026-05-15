@@ -134,7 +134,14 @@ func runConsumeGroup(args []string) {
 					}
 					got++
 				}
-				committed[topic][partition] = maxOff + 1
+				// NOTE: do NOT advance committed[topic][partition] here.
+				// If commit() below fails with errNeedsRejoin (HTTP 426), the
+				// broker still reports the older committed offset on rejoin;
+				// advancing locally first would cause the next fetch to skip
+				// past messages that were never actually persisted, dropping
+				// them on rebalance. The local watermark only moves forward
+				// inside commit()'s success branch, and refreshCommittedOffsets
+				// authoritatively resyncs from the broker after re-join.
 				commits = append(commits, map[string]any{
 					"topic":     topic,
 					"partition": partition,
@@ -267,8 +274,11 @@ func (c *groupClient) join() error {
 	c.mu.Unlock()
 
 	// Best-effort backfill of committed offsets from the broker so we resume
-	// where we left off after a crash + restart.
-	c.refreshCommittedOffsets()
+	// where we left off after a crash + restart. Log + continue on failure;
+	// the consume loop will fall back to whatever's already in c.committed.
+	if err := c.refreshCommittedOffsets(); err != nil {
+		fmt.Fprintf(os.Stderr, "consume-group: refresh offsets: %v\n", err)
+	}
 
 	fmt.Fprintf(os.Stderr, "consume-group: joined %s as %s (gen=%d), assignment=%v\n",
 		c.group, jr.MemberID, jr.Generation, jr.Assignment)
@@ -404,6 +414,15 @@ func (c *groupClient) heartbeatLoop(ctx context.Context) {
 			c.markNeedsRejoin()
 			continue
 		}
+		// Anything else non-2xx (404 = member purged, 500 = broker glitch,
+		// etc.) means our member registration is gone. Force a rejoin so we
+		// don't keep heartbeating to a dead ID.
+		if resp.StatusCode/100 != 2 {
+			fmt.Fprintf(os.Stderr, "consume-group: heartbeat: status %d: %s\n",
+				resp.StatusCode, strings.TrimSpace(string(raw)))
+			c.markNeedsRejoin()
+			continue
+		}
 		var hr struct {
 			RebalanceRequired bool `json:"rebalance_required"`
 		}
@@ -416,12 +435,21 @@ func (c *groupClient) heartbeatLoop(ctx context.Context) {
 
 // refreshCommittedOffsets pulls /groups/{group}/offsets for every subscribed
 // topic and caches it locally so the consume loop knows where to resume.
-func (c *groupClient) refreshCommittedOffsets() {
+//
+// Returns the first non-2xx / transport error it sees. Callers MUST NOT rely
+// on the local cache if this errors — a 404/500 used to silently zero out the
+// cache and cause the consumer to re-read already-committed messages.
+func (c *groupClient) refreshCommittedOffsets() error {
 	for _, topic := range c.topics {
 		u := fmt.Sprintf("%s/groups/%s/offsets?topic=%s", c.broker, url.PathEscape(c.group), url.QueryEscape(topic))
 		resp, err := http.Get(u)
 		if err != nil {
-			continue
+			return fmt.Errorf("offsets %s: %w", topic, err)
+		}
+		if resp.StatusCode/100 != 2 {
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("offsets %s: status %d: %s", topic, resp.StatusCode, strings.TrimSpace(string(raw)))
 		}
 		var body struct {
 			Offsets []struct {
@@ -430,7 +458,10 @@ func (c *groupClient) refreshCommittedOffsets() {
 				Offset    uint64 `json:"committed_offset"`
 			} `json:"offsets"`
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&body)
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			resp.Body.Close()
+			return fmt.Errorf("offsets %s: decode: %w", topic, err)
+		}
 		resp.Body.Close()
 
 		c.mu.Lock()
@@ -442,6 +473,7 @@ func (c *groupClient) refreshCommittedOffsets() {
 		}
 		c.mu.Unlock()
 	}
+	return nil
 }
 
 // printMessage emits one record. JSON mode dumps the raw line; otherwise we
