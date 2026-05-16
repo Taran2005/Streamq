@@ -199,6 +199,67 @@ func TestCoordinator_CommitWrongGeneration(t *testing.T) {
 	}
 }
 
+// TestCoordinator_CommitBeforeFinalize covers the gen-0 stale-commit bug.
+// A coordinator that's freshly restarted (or pre-finalize) must reject every
+// commit until a join → finalize cycle has happened, otherwise an old member
+// from a previous incarnation could overwrite fresh offsets during the
+// vulnerable pre-stable window.
+func TestCoordinator_CommitBeforeFinalize(t *testing.T) {
+	c, _ := newTestCoord(t, map[string]int{"t": 1})
+
+	// Manually wire up a group with a known member but no finalized rebalance
+	// (Generation == 0). This simulates a coordinator that just restarted and
+	// hasn't run a full join cycle yet.
+	g := newGroup("g")
+	g.Members["m1"] = &Member{ID: "m1", Topics: []string{"t"}}
+	c.mu.Lock()
+	c.groups["g"] = g
+	c.mu.Unlock()
+
+	if g.Generation != 0 {
+		t.Fatalf("test prereq: expected gen=0, got %d", g.Generation)
+	}
+
+	err := c.CommitOffsets(context.Background(), "g", "m1", 0,
+		[]CommitInput{{Topic: "t", Partition: 0, Offset: 99}})
+	if !errors.Is(err, ErrGenerationMismatch) {
+		t.Fatalf("expected gen mismatch on pre-finalize commit, got %v", err)
+	}
+
+	// Sanity: a commit claiming gen=1 (or any other) is still rejected when
+	// the coordinator itself hasn't finalized.
+	err = c.CommitOffsets(context.Background(), "g", "m1", 1,
+		[]CommitInput{{Topic: "t", Partition: 0, Offset: 99}})
+	if !errors.Is(err, ErrGenerationMismatch) {
+		t.Fatalf("expected gen mismatch with bogus claimed gen, got %v", err)
+	}
+}
+
+// TestCoordinator_LeaveIdempotent makes sure a double-leave (or a leave
+// after the broker already evicted the member on session timeout) doesn't
+// surface ErrUnknownMember. Real CLI consumers retry leave on SIGINT after
+// the heartbeat had already failed, so this needs to be a no-op.
+func TestCoordinator_LeaveIdempotent(t *testing.T) {
+	c, _ := newTestCoord(t, map[string]int{"t": 1})
+
+	res, _ := c.Join(context.Background(), JoinRequest{GroupName: "g", Topics: []string{"t"}})
+
+	if err := c.Leave("g", res.MemberID); err != nil {
+		t.Fatalf("first leave: %v", err)
+	}
+	if err := c.Leave("g", res.MemberID); err != nil {
+		t.Fatalf("second leave should be a no-op, got: %v", err)
+	}
+	if err := c.Leave("g", "never-existed"); err != nil {
+		t.Fatalf("leave of unknown member should be a no-op, got: %v", err)
+	}
+
+	// Unknown group is still an error — different failure mode entirely.
+	if err := c.Leave("nope", "m"); !errors.Is(err, ErrUnknownGroup) {
+		t.Fatalf("expected unknown group, got %v", err)
+	}
+}
+
 func TestCoordinator_SessionTimeoutDropsMember(t *testing.T) {
 	c, _ := newTestCoord(t, map[string]int{"t": 2})
 

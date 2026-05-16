@@ -242,7 +242,10 @@ func (c *Coordinator) Leave(group, memberID string) error {
 	defer g.mu.Unlock()
 
 	if _, ok := g.Members[memberID]; !ok {
-		return ErrUnknownMember
+		// Idempotent: a SIGINT after the broker already evicted us on
+		// session timeout is normal, and so is a double-leave during retry.
+		// Returning success means callers don't need to special-case it.
+		return nil
 	}
 	delete(g.Members, memberID)
 	delete(g.Assignment, memberID)
@@ -283,10 +286,16 @@ func (c *Coordinator) CommitOffsets(ctx context.Context, group, memberID string,
 	if !memberOK {
 		return ErrUnknownMember
 	}
-	// Generation 0 means "no rebalance ever finalized" — accept any commits
-	// pre-stable so the offset store is usable in single-broker flows that
-	// don't run an explicit join (rare, but cheap to support).
-	if currentGen != 0 && generation != currentGen {
+	// Generation 0 means the group has never finalized a rebalance — either
+	// the coordinator was freshly restarted or no member has rejoined yet. In
+	// that pre-finalize window a stale member from a previous incarnation
+	// could otherwise write old offsets on top of the live ones. Force every
+	// committer to complete at least one join → finalize cycle (gen ≥ 1)
+	// first; the handler turns this into 426 → consumer rejoins → safe.
+	if currentGen == 0 {
+		return ErrGenerationMismatch
+	}
+	if generation != currentGen {
 		return ErrGenerationMismatch
 	}
 
