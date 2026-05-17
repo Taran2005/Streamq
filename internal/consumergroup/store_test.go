@@ -92,6 +92,36 @@ func TestPartitionForGroup_Stable(t *testing.T) {
 	}
 }
 
+// TestParseCommitKey_StrictPartition makes sure "g:t:42abc" is rejected
+// rather than silently parsed as partition 42 (the old fmt.Sscanf behavior).
+// A bad key in __consumer_offsets should be skipped at replay time, not
+// applied to a wrong (group, topic, partition) row.
+func TestParseCommitKey_StrictPartition(t *testing.T) {
+	bad := []string{
+		"g:t:42abc",
+		"g:t:abc42",
+		"g:t:",
+		"g:t: 42",
+		"g:t:42 ",
+		"g:t:0x10",
+		"g:t:-1",
+	}
+	for _, key := range bad {
+		if _, _, _, err := parseCommitKey(key); err == nil {
+			t.Fatalf("expected error for %q", key)
+		}
+	}
+
+	// Sanity: a clean key still parses.
+	g, tn, p, err := parseCommitKey("group:topic:42")
+	if err != nil {
+		t.Fatalf("unexpected error on clean key: %v", err)
+	}
+	if g != "group" || tn != "topic" || p != 42 {
+		t.Fatalf("clean parse got group=%s topic=%s part=%d", g, tn, p)
+	}
+}
+
 func TestCommitKey_RoundTrip(t *testing.T) {
 	cases := []struct {
 		group, topic string

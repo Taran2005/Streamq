@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"strconv"
 	"sync"
 
 	"github.com/streamq/streamq/internal/topic"
@@ -216,9 +217,15 @@ func parseCommitKey(key string) (string, string, int, error) {
 	group := prefix[:secondColon]
 	tn := prefix[secondColon+1:]
 
-	var part int
-	if _, err := fmt.Sscanf(partStr, "%d", &part); err != nil {
+	// strconv.Atoi requires the whole string to be a valid integer, so junk
+	// suffixes like "42abc" are rejected. fmt.Sscanf("%d", ...) would have
+	// happily returned 42, silently corrupting parsing.
+	part, err := strconv.Atoi(partStr)
+	if err != nil {
 		return "", "", 0, fmt.Errorf("malformed commit key partition in %q: %w", key, err)
+	}
+	if part < 0 {
+		return "", "", 0, fmt.Errorf("malformed commit key partition in %q: negative", key)
 	}
 	return group, tn, part, nil
 }

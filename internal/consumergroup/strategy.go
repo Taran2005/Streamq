@@ -110,7 +110,7 @@ func (RoundRobinStrategy) Assign(topics map[string][]int, members []string) map[
 
 	for _, m := range sortedMembers {
 		topicsForMember := perMemberPerTopic[m]
-		for _, t := range sortedTopicKeys2(topicsForMember) {
+		for _, t := range sortedTopicKeys(topicsForMember) {
 			out[m] = append(out[m], Assignment{
 				Topic:      t,
 				Partitions: topicsForMember[t],
@@ -144,15 +144,6 @@ func initAssignments(members []string) map[string][]Assignment {
 }
 
 func sortedTopicKeys(m map[string][]int) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func sortedTopicKeys2(m map[string][]int) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
