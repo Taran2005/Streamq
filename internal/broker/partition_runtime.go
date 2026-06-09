@@ -133,14 +133,6 @@ func (pr *partitionRuntime) onElected(ctx context.Context) {
 	if pr.broker.leaderStates != nil {
 		pr.broker.leaderStates.stateFor(pr.topic, pr.partition)
 	}
-
-	// As leader we own the high watermark — make it match our local store
-	// so consumers see what we have.
-	if t, err := pr.broker.GetTopic(pr.topic); err == nil {
-		if p, err := t.GetPartition(pr.partition); err == nil && p.IsLocal() {
-			p.SetHighWatermark(p.LatestOffset())
-		}
-	}
 }
 
 // onDeposed is called when we lose leadership. Restart the follower pull loop.

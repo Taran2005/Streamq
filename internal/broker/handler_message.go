@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/streamq/streamq/internal/cluster"
@@ -152,17 +153,29 @@ func (s *Server) replicateSync(ctx context.Context, topicName string, partition 
 	if s.broker.replicator == nil || len(followers) == 0 {
 		return nil // nothing to do
 	}
+	var wg sync.WaitGroup
+	errs := make(chan error, len(followers))
 	for _, f := range followers {
-		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		hw, err := s.broker.replicator.Push(pctx, f, topicName, partition, msgs)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("%w: %v", errInsufficientISR, err)
-		}
-		// Follower accepted the batch — note its new offset for ISR tracking.
-		if s.broker.leaderStates != nil {
-			s.broker.leaderStates.noteFollowerSeen(topicName, partition, f, hw, time.Now())
-		}
+		wg.Add(1)
+		go func(follower string) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			hw, err := s.broker.replicator.Push(pctx, follower, topicName, partition, msgs)
+			cancel()
+			if err != nil {
+				errs <- err
+				return
+			}
+			// Follower accepted the batch — note its new offset for ISR tracking.
+			if s.broker.leaderStates != nil {
+				s.broker.leaderStates.noteFollowerSeen(topicName, partition, follower, hw, time.Now())
+			}
+		}(f)
+	}
+	wg.Wait()
+	close(errs)
+	if err, ok := <-errs; ok {
+		return fmt.Errorf("%w: %v", errInsufficientISR, err)
 	}
 	return nil
 }

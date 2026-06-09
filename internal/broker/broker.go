@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -507,7 +508,7 @@ func (b *Broker) recoverFromDisk() error {
 		}
 		topicName := entry.Name()
 
-		topicPath := b.Config.DataDir + "/" + topicName
+		topicPath := filepath.Join(b.Config.DataDir, topicName)
 		partEntries, err := os.ReadDir(topicPath)
 		if err != nil {
 			return fmt.Errorf("read topic dir %s: %w", topicName, err)

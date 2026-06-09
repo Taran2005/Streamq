@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/streamq/streamq/internal/common"
 )
@@ -42,8 +43,11 @@ func NewServer(b *Broker) *Server {
 	mux.HandleFunc("GET /groups", s.listGroups)
 
 	s.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", b.Config.Port),
-		Handler: mux,
+		Addr:              fmt.Sprintf(":%d", b.Config.Port),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 	}
 
 	return s

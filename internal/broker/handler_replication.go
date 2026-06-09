@@ -44,6 +44,12 @@ func (s *Server) replicatePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	maxBytes := int64(s.broker.Config.MaxMessageSize) * 100
+	if maxBytes == 0 {
+		maxBytes = 100 * 1024 * 1024 // 100MB default max batch
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+
 	var req struct {
 		Messages []topic.Message `json:"messages"`
 	}
@@ -81,15 +87,8 @@ func (s *Server) replicatePush(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Replicated tail is now visible to consumers on this follower. The leader
-	// is the source of truth for HW, but at minimum the follower can reveal
-	// what it has — the leader's next /internal/follow response will also push
-	// the leader's view.
-	local := p.LatestOffset()
-	p.SetHighWatermark(local)
-
 	common.WriteJSON(w, http.StatusOK, map[string]any{
-		"high_offset": local,
+		"high_offset": p.LatestOffset(),
 	})
 }
 
