@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,7 +36,11 @@ type Segment struct {
 func NewSegment(dir string, baseOffset uint64, maxBytes int64) (*Segment, error) {
 	logPath := filepath.Join(dir, segmentName(baseOffset, ".sqlog"))
 
-	logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	// We deliberately avoid O_APPEND: Truncate on an O_APPEND handle is
+	// denied on Windows, and we already track the write position
+	// ourselves via s.size, so explicit WriteAt is both portable and
+	// equivalent.
+	logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)
 	}
@@ -55,12 +60,27 @@ func NewSegment(dir string, baseOffset uint64, maxBytes int64) (*Segment, error)
 		index:      make(map[uint64]int64),
 	}
 
-	// Always rebuild index from log (source of truth).
-	// The .sqidx file is just a fast-path cache — if it's corrupt we don't care.
 	if info.Size() > 0 {
-		if err := seg.rebuildIndex(); err != nil {
-			logFile.Close()
-			return nil, fmt.Errorf("rebuild index: %w", err)
+		idxPath := filepath.Join(dir, segmentName(baseOffset, ".sqidx"))
+		if err := seg.loadIndex(idxPath); err == nil {
+			// Index loaded successfully. Determine nextOffset.
+			var maxOffset uint64 = baseOffset
+			hasEntries := false
+			for offset := range seg.index {
+				hasEntries = true
+				if offset > maxOffset {
+					maxOffset = offset
+				}
+			}
+			if hasEntries {
+				seg.nextOffset = maxOffset + 1
+			}
+		} else {
+			// Fallback: file missing or corrupt
+			if err := seg.rebuildIndex(); err != nil {
+				logFile.Close()
+				return nil, fmt.Errorf("rebuild index: %w", err)
+			}
 		}
 	}
 
@@ -74,9 +94,17 @@ func (s *Segment) Append(msg topic.Message) (int64, error) {
 	data := Encode(msg)
 	position := s.size
 
-	n, err := s.logFile.Write(data)
+	// WriteAt rather than Write because we opened without O_APPEND. We
+	// own the write cursor here (s.size) and serialize via s.mu.
+	n, err := s.logFile.WriteAt(data, position)
 	if err != nil {
 		return 0, fmt.Errorf("write to segment: %w", err)
+	}
+
+	// fsync on every append; batched fsync deferred (see PLAN.md).
+	// Without this an "acknowledged" append can vanish on power loss.
+	if err := s.logFile.Sync(); err != nil {
+		return 0, fmt.Errorf("fsync segment: %w", err)
 	}
 
 	s.index[msg.Offset] = position
@@ -160,36 +188,77 @@ func (s *Segment) Sync() error {
 	return s.logFile.Sync()
 }
 
+// rebuildIndex walks the log file and rebuilds the in-memory index.
+//
+// With fsync-on-append (see Append) every record that has been
+// acknowledged is durable. The only legal corruption is a partial
+// trailing record from a crash mid-write. When we hit something that
+// won't decode we truncate the log back to the start of that record
+// and continue cleanly. Anything earlier failing to decode would mean
+// real on-disk corruption — we still surface that as an error.
 func (s *Segment) rebuildIndex() error {
 	var position int64
+	fileSize := s.size
 
-	for {
+	truncate := func(reason string, err error) error {
+		extra := fileSize - position
+		if err := s.logFile.Truncate(position); err != nil {
+			return fmt.Errorf("truncate torn tail at %d: %w", position, err)
+		}
+		s.size = position
+		log.Printf("storage: truncated %d torn bytes from segment %d at offset %d (%s: %v)",
+			extra, s.baseOffset, position, reason, err)
+		return nil
+	}
+
+	for position < fileSize {
+		startPos := position
+
 		lenBuf := make([]byte, headerSize)
-		_, err := s.logFile.ReadAt(lenBuf, position)
-		if err == io.EOF {
+		n, err := s.logFile.ReadAt(lenBuf, startPos)
+		if err == io.EOF || (err == nil && n < headerSize) {
+			if startPos < fileSize {
+				return truncate("short header", io.ErrUnexpectedEOF)
+			}
 			break
 		}
-		if err != nil {
-			return fmt.Errorf("read at position %d: %w", position, err)
+		if err != nil && err != io.EOF {
+			// io.ErrUnexpectedEOF from a partial header is a torn tail.
+			if err == io.ErrUnexpectedEOF {
+				return truncate("short header", err)
+			}
+			return fmt.Errorf("read at position %d: %w", startPos, err)
 		}
 
 		payloadSize := int(binary.BigEndian.Uint32(lenBuf))
 		totalSize := headerSize + payloadSize
 
+		// Bogus length pointing past EOF is a torn tail.
+		if totalSize <= headerSize || startPos+int64(totalSize) > fileSize {
+			return truncate("declared length past EOF", io.ErrUnexpectedEOF)
+		}
+
 		data := make([]byte, totalSize)
-		_, err = s.logFile.ReadAt(data, position)
-		if err != nil {
-			return fmt.Errorf("read message at position %d: %w", position, err)
+		if _, err := s.logFile.ReadAt(data, startPos); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return truncate("short record body", err)
+			}
+			return fmt.Errorf("read message at position %d: %w", startPos, err)
 		}
 
 		msg, err := Decode(data)
 		if err != nil {
-			return fmt.Errorf("decode at position %d: %w", position, err)
+			// Only treat the very last record as a torn tail. Mid-file
+			// decode failures with full bytes available are real corruption.
+			if startPos+int64(totalSize) == fileSize {
+				return truncate("decode failed on tail record", err)
+			}
+			return fmt.Errorf("decode at position %d: %w", startPos, err)
 		}
 
-		s.index[msg.Offset] = position
+		s.index[msg.Offset] = startPos
 		s.nextOffset = msg.Offset + 1
-		position += int64(totalSize)
+		position = startPos + int64(totalSize)
 	}
 
 	return nil
