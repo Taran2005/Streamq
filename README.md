@@ -76,7 +76,21 @@ Internal endpoints (require `X-StreamQ-Internal` header):
 
 ## Architecture
 
-```
+### Cluster and Controller Model
+
+StreamQ uses `etcd` for cluster coordination. Each broker registers its presence and monitors the `/streamq/brokers/` prefix.
+
+One broker is elected as the **Controller** using an etcd lease. The controller watches for cluster membership changes and is responsible for partition assignments. When a new topic is created or a broker joins/leaves, the controller generates a consistent-hash based replica assignment and writes it to `/streamq/assignments/`. 
+
+All brokers watch the assignments prefix. When a broker sees it has been assigned a replica, it starts managing it.
+
+### Replication and Leader Election
+
+Replication is handled at the partition level. For each partition, the assigned replicas hold a sub-election under `/streamq/partition-leaders/{topic}/{partition}/` to determine the leader.
+- The **Leader** receives produce requests, assigns offsets, appends to its local log, and then pushes the message to followers via an internal replication endpoint (`POST /internal/replicate/{topic}/{partition}`).
+- The **Followers** append pre-stamped messages to their logs. If a follower falls behind, the leader drops it from the In-Sync Replicas (ISR) list. Followers can backfill missing data by polling the leader (`GET /internal/follow`).
+
+```text
 cmd/
   broker/                  broker entry point
   bench/                   produce/consume throughput benchmark

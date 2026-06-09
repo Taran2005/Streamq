@@ -68,6 +68,10 @@ func (s *Server) replicatePush(w http.ResponseWriter, r *http.Request) {
 		Messages []topic.Message `json:"messages"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			common.WriteError(w, http.StatusRequestEntityTooLarge, "payload too large")
+			return
+		}
 		common.WriteError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}

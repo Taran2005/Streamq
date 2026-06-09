@@ -42,7 +42,7 @@ func (h *groupHTTP) do(method, path string, body any) (int, []byte) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := h.ts.Client().Do(req)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestGroup_RecoverOffsetsOnRestart(t *testing.T) {
 		}
 		req, _ := http.NewRequest(method, ts.URL+path, rdr)
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := ts.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -464,6 +464,8 @@ func TestGroup_RecoverOffsetsOnRestart(t *testing.T) {
 
 	// Shutdown and reopen.
 	ts.Close()
+	ts.Client().CloseIdleConnections()
+	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +474,10 @@ func TestGroup_RecoverOffsetsOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer b2.Close()
+	defer func() {
+		b2.Close()
+		http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+	}()
 
 	rec, ok := b2.groups.store.Lookup("g", "t", 0)
 	if !ok {

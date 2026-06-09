@@ -191,8 +191,12 @@ func BenchmarkE2E_ProduceConsume(b *testing.B) {
 	}
 	srv := NewServer(br)
 	ts := httptest.NewServer(srv.httpServer.Handler)
-	b.Cleanup(ts.Close)
-
+	b.Cleanup(func() {
+		ts.Close()
+		br.Close()
+		ts.Client().CloseIdleConnections()
+		http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+	})
 	client := ts.Client()
 
 	// Create topic
