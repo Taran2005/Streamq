@@ -70,7 +70,7 @@ func (e *ErrFollowerOutOfSync) Error() string {
 //
 // If the follower reports 409 Conflict with an out_of_sync error, returns an
 // *ErrFollowerOutOfSync so the leader can react (backfill, ISR shrink, etc).
-func (r *Replicator) Push(ctx context.Context, target string, topicName string, partition int, msgs []topic.Message) (uint64, error) {
+func (r *Replicator) Push(ctx context.Context, target string, topicName string, partition int, epoch uint64, msgs []topic.Message) (uint64, error) {
 	if r.forwarder == nil {
 		return 0, fmt.Errorf("replicator: no forwarder configured")
 	}
@@ -93,6 +93,7 @@ func (r *Replicator) Push(ctx context.Context, target string, topicName string, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(InternalHeader, r.token)
+	req.Header.Set("X-StreamQ-Leader-Epoch", fmt.Sprintf("%d", epoch))
 
 	resp, err := r.client.Do(req)
 	if err != nil {
@@ -126,7 +127,7 @@ func (r *Replicator) Push(ctx context.Context, target string, topicName string, 
 
 // Fetch hits the leader's /internal/follow endpoint to pull messages starting
 // at `from`. Returns the messages and the leader's reported high watermark.
-func (r *Replicator) Fetch(ctx context.Context, target string, topicName string, partition int, from uint64, max int) ([]topic.Message, uint64, error) {
+func (r *Replicator) Fetch(ctx context.Context, target string, topicName string, partition int, epoch uint64, from uint64, max int) ([]topic.Message, uint64, error) {
 	if r.forwarder == nil {
 		return nil, 0, fmt.Errorf("replicator: no forwarder configured")
 	}
@@ -141,6 +142,7 @@ func (r *Replicator) Fetch(ctx context.Context, target string, topicName string,
 		return nil, 0, fmt.Errorf("build follow request: %w", err)
 	}
 	req.Header.Set(InternalHeader, r.token)
+	req.Header.Set("X-StreamQ-Leader-Epoch", fmt.Sprintf("%d", epoch))
 
 	resp, err := r.client.Do(req)
 	if err != nil {

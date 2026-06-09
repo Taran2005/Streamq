@@ -31,9 +31,15 @@ type PartitionAssignment struct {
 	Replicas  []string `json:"replicas"`
 	ISR       []string `json:"isr"`
 
+	// Epoch tracks leader term changes for fencing.
+	Epoch     uint64   `json:"epoch"`
+
 	// BrokerID is a legacy alias for Leader. Kept for backwards compat with
 	// pre-Phase-4 callers that only read this field. New code should use Leader.
 	BrokerID string `json:"broker_id"`
+
+	// Revision is the etcd ModRevision of this assignment. Unexported so it doesn't serialize.
+	Revision  int64    `json:"-"`
 }
 
 // normalize ensures BrokerID mirrors Leader and replica/ISR lists are sorted.
@@ -336,8 +342,16 @@ func (am *AssignmentManager) UpdateAssignment(ctx context.Context, a PartitionAs
 		return fmt.Errorf("marshal assignment: %w", err)
 	}
 	key := assignmentKey(a.Topic, a.Partition)
-	if _, err := am.client.Put(ctx, key, string(data)); err != nil {
+
+	txnResp, err := am.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", a.Revision)).
+		Then(clientv3.OpPut(key, string(data))).
+		Commit()
+	if err != nil {
 		return fmt.Errorf("write assignment: %w", err)
+	}
+	if !txnResp.Succeeded {
+		return fmt.Errorf("concurrent modification to assignment %s/%d", a.Topic, a.Partition)
 	}
 	return nil
 }
@@ -375,6 +389,7 @@ func (am *AssignmentManager) loadAll(ctx context.Context) error {
 		if err := json.Unmarshal(kv.Value, &a); err != nil {
 			continue
 		}
+		a.Revision = kv.ModRevision
 		a.normalize()
 		if am.assignments[a.Topic] == nil {
 			am.assignments[a.Topic] = make(map[int]*PartitionAssignment)
@@ -388,15 +403,11 @@ func (am *AssignmentManager) loadAll(ctx context.Context) error {
 
 // watch monitors etcd for assignment changes and updates local cache.
 func (am *AssignmentManager) watch(ctx context.Context) {
-	wch := am.client.Watch(ctx, assignmentPrefix, clientv3.WithPrefix())
-
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case resp, ok := <-wch:
-			if !ok {
-				return
+		wch := am.client.Watch(ctx, assignmentPrefix, clientv3.WithPrefix())
+		for resp := range wch {
+			if resp.Canceled {
+				break
 			}
 			var changed []PartitionAssignment
 			am.mu.Lock()
@@ -405,6 +416,7 @@ func (am *AssignmentManager) watch(ctx context.Context) {
 				case clientv3.EventTypePut:
 					var a PartitionAssignment
 					if err := json.Unmarshal(ev.Kv.Value, &a); err == nil {
+						a.Revision = ev.Kv.ModRevision
 						a.normalize()
 						if am.assignments[a.Topic] == nil {
 							am.assignments[a.Topic] = make(map[int]*PartitionAssignment)
@@ -424,6 +436,16 @@ func (am *AssignmentManager) watch(ctx context.Context) {
 				for _, fn := range listeners {
 					fn(a)
 				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+			// Channel closed (etcd flap) — reload and watch again.
+			if err := am.loadAll(ctx); err != nil {
+				log.Printf("watcher resync loadAll failed: %v", err)
 			}
 		}
 	}

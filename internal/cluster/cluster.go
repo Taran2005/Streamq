@@ -106,22 +106,27 @@ func (c *Cluster) register(ctx context.Context) error {
 
 // keepAlive renews the lease periodically so etcd knows we're alive.
 func (c *Cluster) keepAlive(ctx context.Context) {
-	ch, err := c.client.KeepAlive(ctx, c.leaseID)
-	if err != nil {
-		log.Printf("keepalive failed: %v", err)
-		return
-	}
-
 	for {
+		ch, err := c.client.KeepAlive(ctx, c.leaseID)
+		if err != nil {
+			log.Printf("keepalive failed: %v", err)
+			goto retry
+		}
+
+		for resp := range ch {
+			_ = resp // just drain; the library handles renewal
+		}
+		log.Println("keepalive channel closed")
+
+	retry:
 		select {
 		case <-ctx.Done():
 			return
-		case resp, ok := <-ch:
-			if !ok {
-				log.Println("keepalive channel closed")
-				return
+		case <-time.After(time.Second):
+			// Try to re-register
+			if err := c.register(ctx); err != nil {
+				log.Printf("re-register failed: %v", err)
 			}
-			_ = resp // just drain; the library handles renewal
 		}
 	}
 }
@@ -150,15 +155,11 @@ func (c *Cluster) loadBrokers(ctx context.Context) error {
 
 // watchBrokers watches etcd for broker registrations and departures.
 func (c *Cluster) watchBrokers(ctx context.Context) {
-	wch := c.client.Watch(ctx, brokerPrefix, clientv3.WithPrefix())
-
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case resp, ok := <-wch:
-			if !ok {
-				return
+		wch := c.client.Watch(ctx, brokerPrefix, clientv3.WithPrefix())
+		for resp := range wch {
+			if resp.Canceled {
+				break
 			}
 			c.mu.Lock()
 			for _, ev := range resp.Events {
@@ -177,6 +178,15 @@ func (c *Cluster) watchBrokers(ctx context.Context) {
 				}
 			}
 			c.mu.Unlock()
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+			if err := c.loadBrokers(ctx); err != nil {
+				log.Printf("watcher resync loadBrokers failed: %v", err)
+			}
 		}
 	}
 }

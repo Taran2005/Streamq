@@ -44,6 +44,20 @@ func (s *Server) replicatePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	epochStr := r.Header.Get("X-StreamQ-Leader-Epoch")
+	if epochStr != "" {
+		if epoch, err := strconv.ParseUint(epochStr, 10, 64); err == nil {
+			if a, ok := s.broker.assignments.GetAssignment(topicName, partitionID); ok {
+				if epoch < a.Epoch {
+					common.WriteJSON(w, http.StatusConflict, map[string]any{
+						"error": "stale_leader_epoch",
+					})
+					return
+				}
+			}
+		}
+	}
+
 	maxBytes := int64(s.broker.Config.MaxMessageSize) * 100
 	if maxBytes == 0 {
 		maxBytes = 100 * 1024 * 1024 // 100MB default max batch
@@ -106,6 +120,20 @@ func (s *Server) replicateFollow(w http.ResponseWriter, r *http.Request) {
 	if topicName == "" || perr != nil {
 		common.WriteError(w, http.StatusBadRequest, "bad follow path")
 		return
+	}
+
+	epochStr := r.Header.Get("X-StreamQ-Leader-Epoch")
+	if epochStr != "" {
+		if epoch, err := strconv.ParseUint(epochStr, 10, 64); err == nil {
+			if a, ok := s.broker.assignments.GetAssignment(topicName, partitionID); ok {
+				if epoch < a.Epoch {
+					common.WriteJSON(w, http.StatusConflict, map[string]any{
+						"error": "stale_leader_epoch",
+					})
+					return
+				}
+			}
+		}
 	}
 
 	q := r.URL.Query()

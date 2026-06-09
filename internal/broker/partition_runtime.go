@@ -120,6 +120,7 @@ func (pr *partitionRuntime) onElected(ctx context.Context) {
 		if ok && a.Leader != pr.broker.Config.BrokerID {
 			a.Leader = pr.broker.Config.BrokerID
 			a.BrokerID = pr.broker.Config.BrokerID
+			a.Epoch++
 			// On takeover, conservatively shrink ISR to just us. The ISR
 			// loop will re-add caught-up followers within a few seconds.
 			a.ISR = []string{pr.broker.Config.BrokerID}
@@ -223,7 +224,7 @@ func (pr *partitionRuntime) followOnce(ctx context.Context) {
 	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	msgs, leaderHW, err := b.replicator.Fetch(fctx, a.Leader, pr.topic, pr.partition, from, 500)
+	msgs, leaderHW, err := b.replicator.Fetch(fctx, a.Leader, pr.topic, pr.partition, a.Epoch, from, 500)
 	if err != nil {
 		// Many transient errors (election just happened, leader rebooting).
 		// Don't spam — log only at debug level conceptually.

@@ -30,6 +30,7 @@ type PartitionElector struct {
 	partition int
 
 	isLeader atomic.Bool
+	resigned atomic.Bool
 
 	// onElected is fired (in a fresh goroutine) when this broker wins the
 	// campaign. onDeposed fires when leadership is lost (session expired,
@@ -84,6 +85,11 @@ func (pe *PartitionElector) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
+		}
+
+		if pe.resigned.Load() {
+			<-ctx.Done()
+			return
 		}
 
 		session, err := concurrency.NewSession(pe.client, concurrency.WithTTL(10))
@@ -161,6 +167,7 @@ func (pe *PartitionElector) IsLeader() bool {
 // complete. Returns the assignment update that should be written to etcd —
 // caller may want to ensure the next leader has materialized before exiting.
 func (pe *PartitionElector) Resign(ctx context.Context) error {
+	pe.resigned.Store(true)
 	pe.mu.Lock()
 	el := pe.election
 	pe.mu.Unlock()

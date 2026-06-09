@@ -153,6 +153,10 @@ func (s *Server) replicateSync(ctx context.Context, topicName string, partition 
 	if s.broker.replicator == nil || len(followers) == 0 {
 		return nil // nothing to do
 	}
+	var epoch uint64
+	if a, ok := s.broker.assignments.GetAssignment(topicName, partition); ok {
+		epoch = a.Epoch
+	}
 	var wg sync.WaitGroup
 	errs := make(chan error, len(followers))
 	for _, f := range followers {
@@ -160,7 +164,7 @@ func (s *Server) replicateSync(ctx context.Context, topicName string, partition 
 		go func(follower string) {
 			defer wg.Done()
 			pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			hw, err := s.broker.replicator.Push(pctx, follower, topicName, partition, msgs)
+			hw, err := s.broker.replicator.Push(pctx, follower, topicName, partition, epoch, msgs)
 			cancel()
 			if err != nil {
 				errs <- err
@@ -187,9 +191,17 @@ func (s *Server) replicateBestEffort(ctx context.Context, topicName string, part
 	if s.broker.replicator == nil {
 		return
 	}
-	followers := s.broker.leaderStates.allReplicas(topicName, partition)
+	// Best-effort: we try to reach everyone currently in the replica set
+	// (not just ISR). If we can't reach them, that's fine, they'll pull later.
+	var followers []string
+	var epoch uint64
+	if a, ok := s.broker.assignments.GetAssignment(topicName, partition); ok {
+		followers = a.Replicas
+		epoch = a.Epoch
+	}
+
 	for _, f := range followers {
-		hw, err := s.broker.replicator.Push(ctx, f, topicName, partition, msgs)
+		hw, err := s.broker.replicator.Push(ctx, f, topicName, partition, epoch, msgs)
 		if err != nil {
 			// Out-of-sync: follower will catch up via /internal/follow loop —
 			// expected, not noisy. Other errors get swallowed too because
