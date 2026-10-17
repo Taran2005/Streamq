@@ -12,6 +12,11 @@ import (
 // This prevents garbage topic names from causing file path issues later (Phase 2).
 var validTopicName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,254}$`)
 
+// validInternalTopicName allows the underscores + dots used by reserved
+// system topics (__consumer_offsets, __dlq.<src>). External callers can't
+// hit this path — only the broker creates internal topics.
+var validInternalTopicName = regexp.MustCompile(`^__[a-zA-Z0-9._-]{1,253}$`)
+
 // Topic is a named collection of partitions.
 // Producers write to it, consumers read from it.
 //
@@ -23,15 +28,22 @@ type Topic struct {
 	roundRobin uint64 // atomic counter for round-robin partition selection
 }
 
-// ValidateTopicParams checks topic name and partition count.
+// ValidateTopicParams checks topic name and partition count. Accepts both
+// regular user topics and reserved internal topics (prefix "__").
 func ValidateTopicParams(name string, numPartitions int) error {
-	if !validTopicName.MatchString(name) {
+	if !validTopicName.MatchString(name) && !validInternalTopicName.MatchString(name) {
 		return &common.ValidationError{Message: "invalid topic name: must be alphanumeric+hyphens, 1-255 chars"}
 	}
 	if numPartitions <= 0 || numPartitions > 1024 {
 		return &common.ValidationError{Message: "partition count must be between 1 and 1024"}
 	}
 	return nil
+}
+
+// IsReservedName returns true if a topic name is reserved for broker-internal
+// use. External create-topic requests should reject these.
+func IsReservedName(name string) bool {
+	return len(name) >= 2 && name[0] == '_' && name[1] == '_'
 }
 
 // NewTopic creates a topic with pre-built partitions.

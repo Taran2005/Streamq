@@ -20,7 +20,12 @@ func setupTestServer(t *testing.T) (*httptest.Server, *Broker) {
 	}
 	srv := NewServer(b)
 	ts := httptest.NewServer(srv.httpServer.Handler)
-	t.Cleanup(ts.Close)
+	t.Cleanup(func() {
+		ts.Close()
+		b.Close()
+		ts.Client().CloseIdleConnections()
+		http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+	})
 	return ts, b
 }
 
@@ -63,7 +68,7 @@ func TestCreateAndListTopics(t *testing.T) {
 	}
 
 	// List topics
-	resp, err := http.Get(ts.URL + "/topics")
+	resp, err := ts.Client().Get(ts.URL + "/topics")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +94,7 @@ func TestProduceAndConsume(t *testing.T) {
 	ts, _ := setupTestServer(t)
 
 	// Create topic
-	postJSON(t, ts.URL+"/topics", map[string]any{"name": "test", "partitions": 1})
+	postJSON(t, ts.URL+"/topics", map[string]any{"name": "test", "partitions": 1}).Body.Close()
 
 	// Produce
 	resp := postJSON(t, ts.URL+"/topics/test/messages", map[string]any{
@@ -108,10 +113,10 @@ func TestProduceAndConsume(t *testing.T) {
 	// Produce another
 	postJSON(t, ts.URL+"/topics/test/messages", map[string]any{
 		"key": "k2", "value": "world",
-	})
+	}).Body.Close()
 
 	// Consume
-	resp, err := http.Get(ts.URL + "/topics/test/messages?partition=0&offset=0")
+	resp, err := ts.Client().Get(ts.URL + "/topics/test/messages?partition=0&offset=0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,13 +135,13 @@ func TestProduceAndConsume(t *testing.T) {
 func TestConsumeFromOffset(t *testing.T) {
 	ts, _ := setupTestServer(t)
 
-	postJSON(t, ts.URL+"/topics", map[string]any{"name": "test", "partitions": 1})
-	postJSON(t, ts.URL+"/topics/test/messages", map[string]any{"value": "a"})
-	postJSON(t, ts.URL+"/topics/test/messages", map[string]any{"value": "b"})
-	postJSON(t, ts.URL+"/topics/test/messages", map[string]any{"value": "c"})
+	postJSON(t, ts.URL+"/topics", map[string]any{"name": "test", "partitions": 1}).Body.Close()
+	postJSON(t, ts.URL+"/topics/test/messages", map[string]any{"value": "a"}).Body.Close()
+	postJSON(t, ts.URL+"/topics/test/messages", map[string]any{"value": "b"}).Body.Close()
+	postJSON(t, ts.URL+"/topics/test/messages", map[string]any{"value": "c"}).Body.Close()
 
 	// Read from offset 2 — should only get "c"
-	resp, _ := http.Get(ts.URL + "/topics/test/messages?partition=0&offset=2")
+	resp, _ := ts.Client().Get(ts.URL + "/topics/test/messages?partition=0&offset=2")
 	body := decodeJSON(t, resp)
 	msgs := body["messages"].([]any)
 	if len(msgs) != 1 {
@@ -150,7 +155,7 @@ func TestConsumeFromOffset(t *testing.T) {
 func TestKeyBasedPartitioning(t *testing.T) {
 	ts, _ := setupTestServer(t)
 
-	postJSON(t, ts.URL+"/topics", map[string]any{"name": "test", "partitions": 10})
+	postJSON(t, ts.URL+"/topics", map[string]any{"name": "test", "partitions": 10}).Body.Close()
 
 	// Same key should always go to same partition
 	resp1 := postJSON(t, ts.URL+"/topics/test/messages", map[string]any{
@@ -172,7 +177,10 @@ func TestKeyBasedPartitioning(t *testing.T) {
 func TestTopicNotFound(t *testing.T) {
 	ts, _ := setupTestServer(t)
 
-	resp, _ := http.Get(ts.URL + "/topics/nope/messages?partition=0")
+	resp, err := ts.Client().Get(ts.URL + "/topics/nope/messages?partition=0")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", resp.StatusCode)
@@ -182,7 +190,7 @@ func TestTopicNotFound(t *testing.T) {
 func TestMessageSizeLimit(t *testing.T) {
 	ts, _ := setupTestServer(t)
 
-	postJSON(t, ts.URL+"/topics", map[string]any{"name": "test", "partitions": 1})
+	postJSON(t, ts.URL+"/topics", map[string]any{"name": "test", "partitions": 1}).Body.Close()
 
 	// Create a message that's too big (config default is 1MB)
 	bigValue := make([]byte, 2*1024*1024) // 2MB

@@ -1,28 +1,58 @@
 package broker
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/streamq/streamq/internal/cluster"
 	"github.com/streamq/streamq/internal/common"
 	"github.com/streamq/streamq/internal/storage"
 	"github.com/streamq/streamq/internal/topic"
 )
 
 type Broker struct {
-	Config Config
-	topics map[string]*topic.Topic
-	mu     sync.RWMutex
+	Config  Config
+	topics  map[string]*topic.Topic
+	mu      sync.RWMutex
+
+	// Cluster mode (nil in standalone)
+	cluster     *cluster.Cluster
+	assignments *cluster.AssignmentManager
+	forwarder   *cluster.Forwarder
+	replicator  *cluster.Replicator
+
+	// Replication state
+	leaderStates    *LeaderStateRegistry
+	partitionMgrs   map[string]map[int]*partitionRuntime // topic → partition → runtime
+	pmMu            sync.Mutex
+	shuttingDown    atomic.Bool
+	replicateWG     sync.WaitGroup
+
+	// Consumer groups (Phase 5). Initialized lazily on first use in standalone
+	// mode and on JoinCluster in cluster mode.
+	groups *groupSubsystem
 }
 
 func New(cfg Config) (*Broker, error) {
+	if cfg.InternalToken == "" {
+		cfg.InternalToken = "dev"
+	}
+	if v := os.Getenv("STREAMQ_INTERNAL_TOKEN"); v != "" {
+		cfg.InternalToken = v
+	}
+
 	b := &Broker{
-		Config: cfg,
-		topics: make(map[string]*topic.Topic),
+		Config:        cfg,
+		topics:        make(map[string]*topic.Topic),
+		partitionMgrs: make(map[string]map[int]*partitionRuntime),
 	}
 
 	if cfg.DataDir != "" {
@@ -31,14 +61,185 @@ func New(cfg Config) (*Broker, error) {
 		}
 	}
 
+	// Initialize the consumer-group subsystem in standalone mode immediately.
+	// Cluster mode defers this to JoinCluster (we need cluster wiring to
+	// route group requests across brokers).
+	if !cfg.IsClusterMode() {
+		b.initGroupSubsystem()
+		b.replayOffsetsTopic()
+	}
+
 	return b, nil
 }
 
-func (b *Broker) CreateTopic(name string, numPartitions int) (*topic.Topic, error) {
+// JoinCluster connects to etcd and joins the broker cluster.
+// Must be called after New() and before Start().
+func (b *Broker) JoinCluster() error {
+	if !b.Config.IsClusterMode() {
+		return nil
+	}
+
+	self := cluster.BrokerInfo{
+		ID:   b.Config.BrokerID,
+		Addr: b.Config.AdvertiseAddr,
+	}
+
+	c, err := cluster.NewCluster(b.Config.EtcdEndpoints, self)
+	if err != nil {
+		return fmt.Errorf("join cluster: %w", err)
+	}
+	b.cluster = c
+
+	b.assignments = cluster.NewAssignmentManager(c.Client())
+	// Use a background context for the watcher — it needs to run for the broker's lifetime.
+	// Only the initial load has a timeout.
+	if err := b.assignments.Start(context.Background()); err != nil {
+		c.Close()
+		return fmt.Errorf("start assignment manager: %w", err)
+	}
+
+	b.forwarder = cluster.NewForwarder(c)
+	b.replicator = cluster.NewReplicator(b.Config.BrokerID, b.forwarder, b.Config.InternalToken)
+
+	// Leader state tracker (ISR loop)
+	b.leaderStates = newLeaderStateRegistry(b)
+	go b.leaderStates.Run(context.Background())
+
+	// React to assignment changes — start/stop follower loops and partition
+	// electors as replicas come and go.
+	b.assignments.OnChange(b.onAssignmentChange)
+
+	// Bring up the consumer-group subsystem. In cluster mode the offsets
+	// topic is created (controller) or discovered (non-controller) lazily —
+	// any broker can host a coordinator for groups whose offsets partition
+	// it leads.
+	b.initGroupSubsystem()
+	b.replayOffsetsTopic()
+
+	log.Printf("joined cluster as broker %s", b.Config.BrokerID)
+	return nil
+}
+
+// onAssignmentChange is the watcher callback. It reconciles partition runtimes
+// (elector, follower loop) against the new assignment. Cheap and safe to call
+// repeatedly — partitionRuntime starts everything idempotently.
+func (b *Broker) onAssignmentChange(a cluster.PartitionAssignment) {
+	if !a.HasReplica(b.Config.BrokerID) {
+		// We're not a replica — make sure nothing is running.
+		b.stopPartitionRuntime(a.Topic, a.Partition)
+		return
+	}
+
+	// We're a replica. Ensure local topic + partition exist (lazy create).
+	if _, err := b.GetTopic(a.Topic); err != nil {
+		// Topic may not be cached yet; if assignments know about it,
+		// CreateTopicFromAssignment will be called by the next GetTopic.
+		// Try once more.
+		count := b.assignments.TopicPartitionCount(a.Topic)
+		if count > 0 {
+			if _, cerr := b.CreateTopicFromAssignment(a.Topic, count); cerr != nil {
+				log.Printf("onAssignmentChange %s/%d: create topic: %v", a.Topic, a.Partition, cerr)
+				return
+			}
+		}
+	}
+
+	b.ensurePartitionRuntime(a.Topic, a.Partition)
+}
+
+// ErrNotController is returned when a non-controller broker receives a request
+// that only the controller can handle. ControllerID contains the current leader
+// so the caller can forward the request.
+type ErrNotController struct {
+	ControllerID string
+}
+
+func (e *ErrNotController) Error() string {
+	if e.ControllerID != "" {
+		return fmt.Sprintf("not the controller — forward to %s", e.ControllerID)
+	}
+	return "not the controller — no controller elected"
+}
+
+// CreateTopic creates a new topic. In cluster mode, the controller assigns
+// partitions to brokers. Each broker only creates the partitions it owns locally.
+func (b *Broker) CreateTopic(ctx context.Context, name string, numPartitions int) (*topic.Topic, error) {
 	if err := topic.ValidateTopicParams(name, numPartitions); err != nil {
 		return nil, err
 	}
 
+	// Standalone mode: create all partitions locally (same as before)
+	if !b.Config.IsClusterMode() {
+		return b.createLocalTopic(name, numPartitions)
+	}
+
+	// Cluster mode: only the controller can assign partitions
+	if !b.cluster.IsController() {
+		return nil, &ErrNotController{
+			ControllerID: b.cluster.ControllerID(ctx),
+		}
+	}
+
+	if b.assignments.TopicExists(name) {
+		return nil, &common.AlreadyExistsError{Resource: "topic", Name: name}
+	}
+
+	// Assign partitions across brokers
+	brokers := b.cluster.GetBrokers()
+	rf := b.Config.ReplicationFactor
+	if rf <= 0 {
+		rf = 1
+	}
+	assignments, err := b.assignments.AssignPartitions(ctx, name, numPartitions, rf, brokers)
+	if err != nil {
+		return nil, fmt.Errorf("assign partitions: %w", err)
+	}
+
+	// Create only the partitions assigned to us locally
+	return b.createPartitionsFromAssignment(name, numPartitions, assignments)
+}
+
+// CreateTopicFromAssignment creates local partitions based on existing assignments.
+// Used by non-controller brokers when they learn about a new topic from etcd.
+//
+// With replication, ANY broker that holds a replica (leader or follower) gets
+// a real local store. Only brokers that hold no replica at all get a remote
+// placeholder.
+func (b *Broker) CreateTopicFromAssignment(name string, numPartitions int) (*topic.Topic, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if _, exists := b.topics[name]; exists {
+		return b.topics[name], nil
+	}
+
+	assignments := b.assignments.GetTopicFullAssignments(name)
+	if assignments == nil {
+		return nil, fmt.Errorf("no assignments found for topic %s", name)
+	}
+
+	partitions := make([]*topic.Partition, numPartitions)
+	for i := 0; i < numPartitions; i++ {
+		a, ok := assignments[i]
+		if ok && a.HasReplica(b.Config.BrokerID) {
+			store, err := b.createStore(name, i)
+			if err != nil {
+				return nil, fmt.Errorf("create store for partition %d: %w", i, err)
+			}
+			partitions[i] = topic.NewPartition(i, store)
+		} else {
+			// We don't hold a replica of this partition — placeholder.
+			partitions[i] = topic.NewPartition(i, nil)
+		}
+	}
+
+	t := topic.NewTopic(name, partitions)
+	b.topics[name] = t
+	return t, nil
+}
+
+// createLocalTopic creates a topic with all partitions on this broker (standalone mode).
+func (b *Broker) createLocalTopic(name string, numPartitions int) (*topic.Topic, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -50,7 +251,6 @@ func (b *Broker) CreateTopic(name string, numPartitions int) (*topic.Topic, erro
 	for i := 0; i < numPartitions; i++ {
 		store, err := b.createStore(name, i)
 		if err != nil {
-			// Clean up any stores we already created
 			for j := 0; j < i; j++ {
 				if cerr := partitions[j].Close(); cerr != nil {
 					log.Printf("cleanup partition %d: %v", j, cerr)
@@ -66,18 +266,99 @@ func (b *Broker) CreateTopic(name string, numPartitions int) (*topic.Topic, erro
 	return t, nil
 }
 
-func (b *Broker) GetTopic(name string) (*topic.Topic, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+// createPartitionsFromAssignment creates the topic. Any partition for which
+// we are a replica (leader OR follower) gets a real local store; the rest get
+// remote placeholders.
+func (b *Broker) createPartitionsFromAssignment(name string, numPartitions int, assignments []cluster.PartitionAssignment) (*topic.Topic, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	t, exists := b.topics[name]
-	if !exists {
-		return nil, &common.NotFoundError{Resource: "topic", Name: name}
+	partitions := make([]*topic.Partition, numPartitions)
+	for _, a := range assignments {
+		if a.HasReplica(b.Config.BrokerID) {
+			store, err := b.createStore(name, a.Partition)
+			if err != nil {
+				// Clean up already-created partitions
+				for _, p := range partitions {
+					if p != nil {
+						if cerr := p.Close(); cerr != nil {
+							log.Printf("cleanup partition: %v", cerr)
+						}
+					}
+				}
+				return nil, fmt.Errorf("create store for partition %d: %w", a.Partition, err)
+			}
+			partitions[a.Partition] = topic.NewPartition(a.Partition, store)
+		} else {
+			// Placeholder for remote partitions
+			partitions[a.Partition] = topic.NewPartition(a.Partition, nil)
+		}
 	}
+
+	t := topic.NewTopic(name, partitions)
+	b.topics[name] = t
 	return t, nil
 }
 
+// IsPartitionLocal returns true if this broker owns the given partition.
+func (b *Broker) IsPartitionLocal(topicName string, partition int) bool {
+	if !b.Config.IsClusterMode() {
+		return true // standalone = everything is local
+	}
+	ownerID, ok := b.assignments.GetBrokerForPartition(topicName, partition)
+	if !ok {
+		return false
+	}
+	return ownerID == b.Config.BrokerID
+}
+
+// GetPartitionOwner returns the broker ID that owns a partition.
+func (b *Broker) GetPartitionOwner(topicName string, partition int) (string, bool) {
+	if !b.Config.IsClusterMode() {
+		return b.Config.BrokerID, true
+	}
+	return b.assignments.GetBrokerForPartition(topicName, partition)
+}
+
+func (b *Broker) GetTopic(name string) (*topic.Topic, error) {
+	b.mu.RLock()
+	t, exists := b.topics[name]
+	b.mu.RUnlock()
+
+	if exists {
+		return t, nil
+	}
+
+	// In cluster mode, the topic may exist in etcd but not yet materialized locally.
+	// Lazy-create from assignments if available.
+	if b.Config.IsClusterMode() && b.assignments.TopicExists(name) {
+		numPartitions := b.assignments.TopicPartitionCount(name)
+		return b.CreateTopicFromAssignment(name, numPartitions)
+	}
+
+	return nil, &common.NotFoundError{Resource: "topic", Name: name}
+}
+
+// ListTopics returns user-visible topics. Internal topics (names beginning
+// with "__") are hidden by default — callers that want them call
+// ListAllTopics instead.
 func (b *Broker) ListTopics() []topic.TopicInfo {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	infos := make([]topic.TopicInfo, 0, len(b.topics))
+	for name, t := range b.topics {
+		if isInternalTopic(name) {
+			continue
+		}
+		infos = append(infos, t.Info())
+	}
+	return infos
+}
+
+// ListAllTopics returns every topic including internal ones (__consumer_offsets,
+// __dlq.*). Used when the API caller passes ?internal=true.
+func (b *Broker) ListAllTopics() []topic.TopicInfo {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -88,8 +369,25 @@ func (b *Broker) ListTopics() []topic.TopicInfo {
 	return infos
 }
 
-// Close shuts down all topics and their stores.
+// isInternalTopic returns true if the topic name is reserved for broker-
+// internal data (consumer offsets, DLQs).
+func isInternalTopic(name string) bool {
+	return len(name) >= 2 && name[0] == '_' && name[1] == '_'
+}
+
+// Close shuts down all topics, stores, and cluster connection.
 func (b *Broker) Close() error {
+	// Stop all partition runtimes (electors + follower loops) first.
+	b.stopAllPartitionRuntimes()
+
+	if b.leaderStates != nil {
+		b.leaderStates.Stop()
+	}
+
+	if b.groups != nil && b.groups.coordinator != nil {
+		b.groups.coordinator.Stop()
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -101,16 +399,105 @@ func (b *Broker) Close() error {
 			}
 		}
 	}
+
+	if b.cluster != nil {
+		if b.assignments != nil {
+			b.assignments.Stop()
+		}
+		if err := b.cluster.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	return firstErr
 }
 
+// IsShuttingDown reports whether graceful shutdown has been initiated. Used
+// by handlers to reject new produce traffic.
+func (b *Broker) IsShuttingDown() bool {
+	return b.shuttingDown.Load()
+}
+
+// Shutdown performs ordered graceful shutdown: leadership transfer, drain,
+// then close. Called by cmd/broker on SIGTERM before Server.Shutdown +
+// Broker.Close.
+//
+// Sequence:
+//  1. Mark broker as shutting-down so new produces return 503.
+//  2. For each partition we lead: pick most-caught-up ISR member, resign
+//     election, wait briefly for the new leader to register.
+//  3. Wait up to 2s for in-flight replication pushes to drain.
+//
+// Caller is still responsible for HTTP server shutdown and Close().
+func (b *Broker) Shutdown(ctx context.Context) error {
+	if !b.Config.IsClusterMode() {
+		return nil
+	}
+	b.shuttingDown.Store(true)
+
+	// Resign every partition we currently lead.
+	b.pmMu.Lock()
+	var resignTargets []*partitionRuntime
+	for _, parts := range b.partitionMgrs {
+		for _, pr := range parts {
+			if pr.elector != nil && pr.elector.IsLeader() {
+				resignTargets = append(resignTargets, pr)
+			}
+		}
+	}
+	b.pmMu.Unlock()
+
+	for _, pr := range resignTargets {
+		rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
+		if err := pr.elector.Resign(rctx); err != nil {
+			log.Printf("shutdown: resign %s/%d: %v", pr.topic, pr.partition, err)
+		}
+		rcancel()
+		// Best-effort wait for someone else to win.
+		waitCtx, wcancel := context.WithTimeout(ctx, 2*time.Second)
+		b.waitForNewLeader(waitCtx, pr.topic, pr.partition)
+		wcancel()
+	}
+
+	// Wait for in-flight replication pushes to drain.
+	drainCh := make(chan struct{})
+	go func() {
+		b.replicateWG.Wait()
+		close(drainCh)
+	}()
+	select {
+	case <-drainCh:
+	case <-time.After(2 * time.Second):
+		log.Printf("shutdown: replication drain timed out")
+	case <-ctx.Done():
+	}
+
+	return nil
+}
+
+// waitForNewLeader polls the assignment until Leader != self or ctx expires.
+func (b *Broker) waitForNewLeader(ctx context.Context, topicName string, partition int) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		a, ok := b.assignments.GetAssignment(topicName, partition)
+		if ok && a.Leader != "" && a.Leader != b.Config.BrokerID {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // recoverFromDisk scans the data directory and re-registers topics/partitions.
-// Directory layout: {DataDir}/{topicName}/{partitionID}/
 func (b *Broker) recoverFromDisk() error {
 	entries, err := os.ReadDir(b.Config.DataDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // no data dir yet, nothing to recover
+			return nil
 		}
 		return err
 	}
@@ -121,14 +508,12 @@ func (b *Broker) recoverFromDisk() error {
 		}
 		topicName := entry.Name()
 
-		// Discover partition directories (named "0", "1", "2", ...)
-		topicPath := b.Config.DataDir + "/" + topicName
+		topicPath := filepath.Join(b.Config.DataDir, topicName)
 		partEntries, err := os.ReadDir(topicPath)
 		if err != nil {
 			return fmt.Errorf("read topic dir %s: %w", topicName, err)
 		}
 
-		// Collect partition IDs
 		var partIDs []int
 		for _, pe := range partEntries {
 			if !pe.IsDir() {
@@ -158,7 +543,6 @@ func (b *Broker) recoverFromDisk() error {
 			partitions[id] = topic.NewPartition(id, ds)
 		}
 
-		// Fill any gaps with empty disk stores
 		for i := 0; i < numPartitions; i++ {
 			if partitions[i] == nil {
 				dir := storage.DataDir(b.Config.DataDir, topicName, i)
@@ -179,7 +563,6 @@ func (b *Broker) recoverFromDisk() error {
 }
 
 // createStore builds the right store type based on config.
-// Empty DataDir = memory, otherwise disk.
 func (b *Broker) createStore(topicName string, partitionID int) (topic.Store, error) {
 	if b.Config.DataDir == "" {
 		return storage.NewMemoryStore(), nil

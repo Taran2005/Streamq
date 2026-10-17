@@ -179,20 +179,14 @@ func (ds *DiskStore) activeSegment() *Segment {
 }
 
 // findSegment returns the index of the segment that should contain the given offset.
-// Uses binary search on baseOffsets. Returns -1 if offset is past all segments.
+// Uses binary search to find the first segment where NextOffset > offset.
+// Returns -1 if offset is past all segments.
 func (ds *DiskStore) findSegment(offset uint64) int {
 	idx := sort.Search(len(ds.segments), func(i int) bool {
-		return ds.segments[i].BaseOffset() > offset
+		return ds.segments[i].NextOffset() > offset
 	})
-	idx--
 
-	if idx < 0 {
-		return -1
-	}
-
-	// Verify the segment actually has data at or after this offset.
-	// Without this, a gap between segments could return the wrong one.
-	if offset >= ds.activeSegment().NextOffset() {
+	if idx == len(ds.segments) {
 		return -1
 	}
 
